@@ -21,7 +21,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import urljoin
 
-import anthropic
+import ollama
 import openpyxl
 import pdfplumber
 import requests
@@ -45,16 +45,8 @@ OUTPUT_DIR      = Path(__file__).parent.parent / "output"
 RECIPIENT       = "alex@bsa.ai"
 SENDER_EMAIL    = os.getenv("SENDER_EMAIL")
 SENDER_PASS     = os.getenv("SENDER_APP_PASSWORD")
-MODEL           = "claude-sonnet-4-6"
-
-_api_key = os.getenv("ANTHROPIC_API_KEY")
-if not _api_key:
-    log.warning("ANTHROPIC_API_KEY not set — Claude features will fail")
-CLAUDE_CLIENT = anthropic.Anthropic(
-    api_key=_api_key or "missing",
-    timeout=60.0,        # seconds per request
-    max_retries=2,       # Anthropic SDK-level retries before raising
-)
+MODEL           = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+OLLAMA_HOST     = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; BSA-Scout/1.0; +https://bsa.ai)"}
 TIMEOUT = 30
@@ -271,22 +263,22 @@ def scrape_site(site: dict) -> list[dict]:
     return found
 
 
-# ── Claude source discovery ───────────────────────────────────────────────────
+# ── Local model source discovery ─────────────────────────────────────────────
 DISCOVER_PROMPT = """\
 You are helping a Tanzanian data analytics and fintech consulting firm find procurement portals.
 
 Company profile summary:
 {profile}
 
-Search the web for procurement portals, tender pages, and consulting opportunity listings
-specifically covering Tanzania in these service areas:
+Based on your knowledge, list procurement portals, tender pages, and consulting opportunity
+listings that cover Tanzania in these service areas:
 - Data analytics, research, AI/machine learning
 - Finance, fintech, credit scoring
 - Capacity building, facilitation, training
 - Monitoring & evaluation, digital transformation
 - ICT and information systems
 
-Find direct URLs to the tenders/opportunities listing pages for:
+Include direct URLs to tenders/opportunities listing pages for:
 1. UN agency Tanzania procurement portals (UNDP, UNICEF, WHO, FAO, ILO, UN Women, UNOPS)
 2. Tanzania government portals (PPRA, Ministry of Finance, TANESCO, TRA, NBS)
 3. Bilateral donors (KfW, SIDA, FCDO, USAID, GIZ sub-portals, Danida, JICA)
@@ -300,38 +292,31 @@ Return ONLY a valid JSON array — no explanation, no markdown:
 
 def discover_sources(profile: str, existing_urls: set[str]) -> list[dict]:
     """
-    Use Claude with web search to find new Tanzania consulting opportunity portals.
+    Use the local Ollama model to suggest new Tanzania consulting opportunity portals.
     Returns a list of new site dicts (deduped against existing_urls).
     Gracefully returns [] on any failure.
     """
-    log.info("Asking Claude to discover new opportunity sources via web search...")
+    log.info("Asking local model to suggest new opportunity sources...")
     try:
-        resp = CLAUDE_CLIENT.messages.create(
+        response = ollama.chat(
             model=MODEL,
-            max_tokens=2000,
-            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
             messages=[{
                 "role": "user",
                 "content": DISCOVER_PROMPT.format(profile=profile[:800]),
             }],
+            options={"temperature": 0.3, "num_predict": 2000},
         )
-
-        # Extract the last text block (Claude's final synthesis after web searches)
-        text = ""
-        for block in reversed(resp.content):
-            if hasattr(block, "text") and block.text.strip():
-                text = block.text.strip()
-                break
+        text = response.message.content.strip()
 
         if not text:
-            log.warning("discover_sources: Claude returned no text content")
+            log.warning("discover_sources: model returned empty response")
             return []
 
         # Strip markdown fences, then find JSON array
         text = re.sub(r"(^```json\s*)|(\s*```$)", "", text, flags=re.MULTILINE).strip()
         match = re.search(r"\[[^\]]*(?:\[[^\]]*\][^\]]*)*\]", text, re.DOTALL)
         if not match:
-            log.warning("discover_sources: No JSON array found in Claude response")
+            log.warning("discover_sources: no JSON array found in model response")
             return []
 
         raw_sites: list = json.loads(match.group())
@@ -346,7 +331,7 @@ def discover_sources(profile: str, existing_urls: set[str]) -> list[dict]:
             s.setdefault("use_playwright", any(d in s["url"] for d in _JS_DOMAINS))
             new_sites.append(s)
 
-        log.info(f"Claude discovered {len(new_sites)} new opportunity sources")
+        log.info(f"Model suggested {len(new_sites)} new opportunity sources")
         return new_sites
 
     except Exception as e:
@@ -413,19 +398,19 @@ def _validate_assessment(data: dict) -> bool:
 
 
 def assess(opp: dict, profile: str) -> dict | None:
-    """Ask Claude to assess fit for one opportunity. Returns None on failure."""
+    """Ask local Ollama model to assess fit for one opportunity. Returns None on failure."""
     prompt = ASSESS_PROMPT.format(
         profile=profile[:2000],
         opp_text=opp["raw_text"][:4000],
         source=opp["source"],
     )
     try:
-        resp = CLAUDE_CLIENT.messages.create(
+        response = ollama.chat(
             model=MODEL,
-            max_tokens=900,
             messages=[{"role": "user", "content": prompt}],
+            options={"temperature": 0.1, "num_predict": 900},
         )
-        text = resp.content[0].text.strip()
+        text = response.message.content.strip()
         text = re.sub(r"(^```json\s*)|(\s*```$)", "", text, flags=re.MULTILINE)
         data = json.loads(text)
 
@@ -438,13 +423,7 @@ def assess(opp: dict, profile: str) -> dict | None:
         return data
 
     except json.JSONDecodeError as e:
-        log.warning(f"Claude returned invalid JSON for '{opp['title'][:60]}': {e}")
-        return None
-    except anthropic.APIStatusError as e:
-        log.error(f"Claude API error (status {e.status_code}) for '{opp['title'][:60]}': {e.message}")
-        return None
-    except anthropic.APIConnectionError as e:
-        log.error(f"Claude API connection error for '{opp['title'][:60]}': {e}")
+        log.warning(f"Model returned invalid JSON for '{opp['title'][:60]}': {e}")
         return None
     except Exception as e:
         log.warning(f"Assessment failed for '{opp['title'][:60]}': {e!r}")
@@ -689,7 +668,6 @@ def main() -> int:
         result = assess(opp, profile)
         if result:
             assessed.append(result)
-        time.sleep(1.2)  # respect Claude rate limits
 
     if not assessed:
         log.warning("No opportunities successfully assessed.")

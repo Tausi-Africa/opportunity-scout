@@ -70,17 +70,14 @@ def site_with_filter() -> dict:
 
 
 @pytest.fixture()
-def mock_claude_client(monkeypatch, sample_assessment):
-    """Patch CLAUDE_CLIENT.messages.create to return a valid assessment JSON."""
+def mock_ollama_client(monkeypatch, sample_assessment):
+    """Patch ollama.chat to return a valid assessment JSON response."""
     import main as m
 
     mock_response = MagicMock()
-    mock_response.content = [MagicMock(text=json.dumps(sample_assessment))]
-
-    mock_client = MagicMock()
-    mock_client.messages.create.return_value = mock_response
-    monkeypatch.setattr(m, "CLAUDE_CLIENT", mock_client)
-    return mock_client
+    mock_response.message.content = json.dumps(sample_assessment)
+    monkeypatch.setattr(m.ollama, "chat", lambda **kwargs: mock_response)
+    return mock_response
 
 
 @pytest.fixture()

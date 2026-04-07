@@ -1,6 +1,9 @@
 # .github/workflows/weekly_scout.yml
 # Runs every Monday at 07:00 Tanzania time (04:00 UTC)
 # Manual trigger available via GitHub Actions UI
+#
+# AI assessment runs locally via Ollama (no external AI API key needed).
+# Only required secrets: SENDER_EMAIL and SENDER_APP_PASSWORD (Gmail App Password).
 
 name: Weekly BSA Opportunity Scout
 
@@ -11,6 +14,7 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # opt into Node.js 24 runtime
+  OLLAMA_MODEL: llama3.2:1b
 
 jobs:
   # ── Job 1: Run tests ────────────────────────────────────────────────────────
@@ -47,7 +51,6 @@ jobs:
             -v
         env:
           # Provide dummy values so imports don't fail during tests
-          ANTHROPIC_API_KEY: dummy-key-for-tests
           SENDER_EMAIL: dummy@example.com
           SENDER_APP_PASSWORD: dummy-password
 
@@ -64,7 +67,7 @@ jobs:
     name: Scrape and report
     runs-on: ubuntu-latest
     needs: test          # blocked until test job succeeds
-    timeout-minutes: 45
+    timeout-minutes: 90  # Ollama CPU inference needs extra time
 
     steps:
       - name: Checkout repo
@@ -84,64 +87,50 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Verify secrets are set
+      - name: Cache Ollama model
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-${{ env.OLLAMA_MODEL }}-v1
+          restore-keys: ollama-${{ env.OLLAMA_MODEL }}
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama and pull model
+        run: |
+          ollama serve &
+          echo "Waiting for Ollama to start..."
+          sleep 5
+          echo "Pulling model $OLLAMA_MODEL ..."
+          ollama pull "$OLLAMA_MODEL"
+          echo "Model ready."
+
+      - name: Verify email secrets are set
         env:
-          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
           SENDER_EMAIL:        ${{ secrets.SENDER_EMAIL }}
           SENDER_APP_PASSWORD: ${{ secrets.SENDER_APP_PASSWORD }}
         run: |
           MISSING=()
-          [ -z "$ANTHROPIC_API_KEY" ]   && MISSING+=("ANTHROPIC_API_KEY")
           [ -z "$SENDER_EMAIL" ]        && MISSING+=("SENDER_EMAIL")
           [ -z "$SENDER_APP_PASSWORD" ] && MISSING+=("SENDER_APP_PASSWORD")
-
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "ERROR: The following secrets are not set in this repository:"
-            for s in "${MISSING[@]}"; do echo "  • $s"; done
-            echo ""
-            echo "Go to: GitHub repo → Settings → Secrets and variables → Actions → New repository secret"
-            exit 1
+            echo "WARNING: Email secrets not set — report will be saved as artifact only."
+            echo "  Missing: ${MISSING[*]}"
+            echo "  Go to: GitHub repo → Settings → Secrets and variables → Actions"
+          else
+            echo "Email secrets present:"
+            echo "  SENDER_EMAIL        : $SENDER_EMAIL"
+            echo "  SENDER_APP_PASSWORD : ${#SENDER_APP_PASSWORD} chars"
           fi
-
-          echo "All secrets present:"
-          echo "  ANTHROPIC_API_KEY   : ${#ANTHROPIC_API_KEY} chars (starts with ${ANTHROPIC_API_KEY:0:10}...)"
-          echo "  SENDER_EMAIL        : $SENDER_EMAIL"
-          echo "  SENDER_APP_PASSWORD : ${#SENDER_APP_PASSWORD} chars"
-
-      - name: Test Claude API connectivity
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          echo "=== DNS resolution ==="
-          nslookup api.anthropic.com || true
-          echo ""
-          echo "=== Minimal Claude API call ==="
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "Warning: ANTHROPIC_API_KEY not set — skipping API test"
-            exit 0
-          fi
-          HTTP_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
-            -H "authorization: Bearer ${ANTHROPIC_API_KEY}" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d '{"model":"claude-opus-4-1","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}' \
-            https://api.anthropic.com/v1/messages)
-          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
-          BODY=$(echo "$HTTP_RESPONSE" | grep -v "HTTP_STATUS:")
-          echo "Status: $HTTP_STATUS"
-          echo "Body: $BODY"
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "ERROR: Claude API returned HTTP $HTTP_STATUS — check ANTHROPIC_API_KEY secret"
-            exit 1
-          fi
-          echo "Claude API connectivity: OK"
 
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
 
       - name: Run opportunity scout
         env:
-          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          OLLAMA_HOST:         http://localhost:11434
+          OLLAMA_MODEL:        ${{ env.OLLAMA_MODEL }}
           SENDER_EMAIL:        ${{ secrets.SENDER_EMAIL }}
           SENDER_APP_PASSWORD: ${{ secrets.SENDER_APP_PASSWORD }}
         run: python scripts/main.py

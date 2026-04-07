@@ -1,19 +1,18 @@
 """
-Tests for the Claude AI fit assessment: assess() and _validate_assessment().
+Tests for the local model fit assessment: assess() and _validate_assessment().
 """
 import json
 from unittest.mock import MagicMock
 
-import anthropic
 import pytest
 
 import main as m
 
 
-def _make_claude_response(text: str):
-    """Build a minimal mock Claude API response containing `text`."""
+def _make_ollama_response(text: str):
+    """Build a minimal mock Ollama response containing `text`."""
     resp = MagicMock()
-    resp.content = [MagicMock(text=text)]
+    resp.message.content = text
     return resp
 
 
@@ -51,11 +50,10 @@ class TestAssess:
     def test_returns_assessment_on_valid_response(
         self, sample_opportunity, sample_assessment, sample_profile, monkeypatch
     ):
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _make_claude_response(
-            json.dumps(sample_assessment)
+        monkeypatch.setattr(
+            m.ollama, "chat",
+            lambda **kwargs: _make_ollama_response(json.dumps(sample_assessment)),
         )
-        monkeypatch.setattr(m, "CLAUDE_CLIENT", mock_client)
 
         result = m.assess(sample_opportunity, sample_profile)
 
@@ -68,9 +66,10 @@ class TestAssess:
         self, sample_opportunity, sample_assessment, sample_profile, monkeypatch
     ):
         wrapped = f"```json\n{json.dumps(sample_assessment)}\n```"
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _make_claude_response(wrapped)
-        monkeypatch.setattr(m, "CLAUDE_CLIENT", mock_client)
+        monkeypatch.setattr(
+            m.ollama, "chat",
+            lambda **kwargs: _make_ollama_response(wrapped),
+        )
 
         result = m.assess(sample_opportunity, sample_profile)
         assert result is not None
@@ -79,11 +78,10 @@ class TestAssess:
     def test_returns_none_on_invalid_json(
         self, sample_opportunity, sample_profile, monkeypatch
     ):
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _make_claude_response(
-            "Sorry, I cannot assess this right now."
+        monkeypatch.setattr(
+            m.ollama, "chat",
+            lambda **kwargs: _make_ollama_response("Sorry, I cannot assess this right now."),
         )
-        monkeypatch.setattr(m, "CLAUDE_CLIENT", mock_client)
 
         result = m.assess(sample_opportunity, sample_profile)
         assert result is None
@@ -92,35 +90,21 @@ class TestAssess:
         self, sample_opportunity, sample_assessment, sample_profile, monkeypatch
     ):
         del sample_assessment["fit_assessment"]
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _make_claude_response(
-            json.dumps(sample_assessment)
+        monkeypatch.setattr(
+            m.ollama, "chat",
+            lambda **kwargs: _make_ollama_response(json.dumps(sample_assessment)),
         )
-        monkeypatch.setattr(m, "CLAUDE_CLIENT", mock_client)
 
         result = m.assess(sample_opportunity, sample_profile)
         assert result is None
 
-    def test_returns_none_on_api_status_error(
+    def test_returns_none_on_model_exception(
         self, sample_opportunity, sample_profile, monkeypatch
     ):
-        mock_client = MagicMock()
-        mock_client.messages.create.side_effect = anthropic.APIStatusError(
-            message="rate limit", response=MagicMock(status_code=429), body={}
-        )
-        monkeypatch.setattr(m, "CLAUDE_CLIENT", mock_client)
+        def raise_err(**kwargs):
+            raise ConnectionError("connection refused to ollama server")
 
-        result = m.assess(sample_opportunity, sample_profile)
-        assert result is None
-
-    def test_returns_none_on_connection_error(
-        self, sample_opportunity, sample_profile, monkeypatch
-    ):
-        mock_client = MagicMock()
-        mock_client.messages.create.side_effect = anthropic.APIConnectionError(
-            request=MagicMock()
-        )
-        monkeypatch.setattr(m, "CLAUDE_CLIENT", mock_client)
+        monkeypatch.setattr(m.ollama, "chat", raise_err)
 
         result = m.assess(sample_opportunity, sample_profile)
         assert result is None
@@ -129,11 +113,10 @@ class TestAssess:
         self, sample_opportunity, sample_assessment, sample_profile, monkeypatch
     ):
         sample_assessment["fit_assessment"] = "unknown_value"
-        mock_client = MagicMock()
-        mock_client.messages.create.return_value = _make_claude_response(
-            json.dumps(sample_assessment)
+        monkeypatch.setattr(
+            m.ollama, "chat",
+            lambda **kwargs: _make_ollama_response(json.dumps(sample_assessment)),
         )
-        monkeypatch.setattr(m, "CLAUDE_CLIENT", mock_client)
 
         result = m.assess(sample_opportunity, sample_profile)
         assert result is None
