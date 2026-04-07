@@ -51,13 +51,10 @@ class TestSendEmail:
         excel = tmp_output / "report.xlsx"
         excel.write_bytes(b"fake xlsx content")
 
-        captured_subject = {}
+        captured = {}
 
         def fake_sendmail(from_addr, to_addr, msg_str):
-            for line in msg_str.splitlines():
-                if line.startswith("Subject:"):
-                    captured_subject["subject"] = line
-                    break
+            captured["msg"] = msg_str
 
         mock_smtp = MagicMock()
         mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
@@ -67,14 +64,15 @@ class TestSendEmail:
         with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
             m.send_email(excel, _opps(fit_count=3))
 
-        # Subject may be RFC 2047 encoded (e.g. em-dash triggers quoted-printable).
-        # Decode all parts before asserting.
-        raw = captured_subject.get("subject", "").replace("Subject: ", "", 1)
-        decoded = "".join(
+        # Parse with Python's email library — handles RFC 2047 encoding transparently.
+        import email as _email
+        msg = _email.message_from_string(captured["msg"])
+        subject_parts = _decode_header(msg["Subject"])
+        decoded_subject = "".join(
             part.decode(enc or "utf-8") if isinstance(part, bytes) else part
-            for part, enc in _decode_header(raw)
+            for part, enc in subject_parts
         )
-        assert "3 Strong Fit" in decoded
+        assert "3 Strong Fit" in decoded_subject
 
     def test_returns_false_and_saves_fallback_on_auth_error(self, tmp_output):
         excel = tmp_output / "report.xlsx"
