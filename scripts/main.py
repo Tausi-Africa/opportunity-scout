@@ -124,36 +124,53 @@ def is_relevant(text: str) -> bool:
 
 
 @retry(max_retries=3, backoff=2.0, exceptions=(requests.RequestException, OSError))
-def safe_get(url: str) -> requests.Response | None:
-    """HTTP GET with retry. Returns None (not raises) on permanent failure."""
+def _safe_get_retried(url: str) -> requests.Response | None:
+    """
+    Inner HTTP GET — retried up to 3× on transient failures.
+    Returns None for permanent 4xx errors (no retry). Raises on 5xx / timeouts
+    so the retry decorator can catch and retry them.
+    """
     try:
         r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         return r
     except requests.HTTPError as e:
-        status = e.response.status_code if e.response is not None else "?"
+        status = getattr(getattr(e, "response", None), "status_code", None)
         if status in (403, 404, 410):
-            log.warning(f"Permanent HTTP {status} for {url} — skipping")
-            return None  # don't retry 4xx client errors
-        raise  # retry 5xx server errors
-    except requests.Timeout:
-        log.warning(f"Timeout fetching {url}")
-        raise
-    except requests.ConnectionError as e:
-        log.warning(f"Connection error for {url}: {e}")
-        raise
+            log.warning(f"Permanent HTTP {status} for {url} — skipping (no retry)")
+            return None  # return None → retry decorator sees success, stops retrying
+        raise  # 5xx → retry decorator catches and retries
+
+
+def safe_get(url: str) -> requests.Response | None:
+    """
+    HTTP GET with automatic retry. Always returns None on failure — never raises.
+    Callers can treat None as "this URL is unavailable".
+    """
+    try:
+        return _safe_get_retried(url)
     except Exception as e:
-        log.warning(f"GET failed for {url}: {e}")
+        log.warning(f"GET failed for {url} after retries: {e!r}")
         return None
 
 
 def find_pdf_links(soup: BeautifulSoup, base_url: str) -> list[str]:
+    from urllib.parse import urlparse
+    parsed_base = urlparse(base_url)
+    origin = f"{parsed_base.scheme}://{parsed_base.netloc}"  # e.g. https://example.com
+
     pdfs = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if href.lower().endswith(".pdf"):
-            full = href if href.startswith("http") else base_url.rstrip("/") + "/" + href.lstrip("/")
-            pdfs.append(full)
+        if not href.lower().endswith(".pdf"):
+            continue
+        if href.startswith("http"):
+            full = href                            # already absolute
+        elif href.startswith("/"):
+            full = origin + href                  # root-relative → scheme+host only
+        else:
+            full = base_url.rstrip("/") + "/" + href  # path-relative → append to base
+        pdfs.append(full)
     return pdfs[:3]  # cap at 3 PDFs per page
 
 

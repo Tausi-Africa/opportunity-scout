@@ -3,6 +3,7 @@ Tests for scraping helpers: is_relevant, safe_get, find_pdf_links,
 _passes_country_filter, parse_pdf, _fetch_detail, scrape_site.
 """
 import io
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -157,23 +158,39 @@ class TestPassesCountryFilter:
 
 # ── parse_pdf ─────────────────────────────────────────────────────────────────
 
-class TestParsePdf:
-    def test_returns_text_from_valid_pdf(self):
-        mock_page = MagicMock()
-        mock_page.extract_text.return_value = "Eligibility: registered firm"
-        mock_pdf   = MagicMock()
-        mock_pdf.__enter__ = MagicMock(return_value=mock_pdf)
-        mock_pdf.__exit__  = MagicMock(return_value=False)
-        mock_pdf.pages     = [mock_page]
+SAMPLE_PDF_PATH = Path(__file__).parent.parent / "samplePDFs" / "sample.pdf"
 
+
+class TestParsePdf:
+    def test_returns_text_from_real_pdf(self):
+        """Uses samplePDFs/sample.pdf — a real PDF parsed by pdfplumber."""
+        assert SAMPLE_PDF_PATH.exists(), (
+            f"Sample PDF not found at {SAMPLE_PDF_PATH}. "
+            "Add a PDF file at samplePDFs/sample.pdf to run this test."
+        )
+        pdf_bytes = SAMPLE_PDF_PATH.read_bytes()
         mock_resp = MagicMock()
-        mock_resp.content = b"%PDF fake"
+        mock_resp.content = pdf_bytes
 
         with patch("main.safe_get", return_value=mock_resp):
-            with patch("main.pdfplumber.open", return_value=mock_pdf):
-                result = m.parse_pdf("https://example.com/brief.pdf")
+            result = m.parse_pdf("https://example.com/brief.pdf")
 
-        assert "Eligibility" in result
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_real_pdf_contains_expected_content(self):
+        """Checks that the sample PDF text includes known eligibility content."""
+        assert SAMPLE_PDF_PATH.exists(), (
+            f"Sample PDF not found at {SAMPLE_PDF_PATH}."
+        )
+        pdf_bytes = SAMPLE_PDF_PATH.read_bytes()
+        mock_resp = MagicMock()
+        mock_resp.content = pdf_bytes
+
+        with patch("main.safe_get", return_value=mock_resp):
+            result = m.parse_pdf("https://example.com/brief.pdf")
+
+        assert "Eligibility" in result or "eligibility" in result.lower()
 
     def test_returns_empty_when_get_fails(self):
         with patch("main.safe_get", return_value=None):

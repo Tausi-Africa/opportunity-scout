@@ -2,6 +2,7 @@
 Tests for send_email(): success path, auth failure, SMTP errors, fallback file.
 """
 import smtplib
+from email.header import decode_header as _decode_header
 from unittest.mock import MagicMock, patch, mock_open
 from pathlib import Path
 
@@ -66,7 +67,14 @@ class TestSendEmail:
         with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
             m.send_email(excel, _opps(fit_count=3))
 
-        assert "3 Strong Fit" in captured_subject.get("subject", "")
+        # Subject may be RFC 2047 encoded (e.g. em-dash triggers quoted-printable).
+        # Decode all parts before asserting.
+        raw = captured_subject.get("subject", "").replace("Subject: ", "", 1)
+        decoded = "".join(
+            part.decode(enc or "utf-8") if isinstance(part, bytes) else part
+            for part, enc in _decode_header(raw)
+        )
+        assert "3 Strong Fit" in decoded
 
     def test_returns_false_and_saves_fallback_on_auth_error(self, tmp_output):
         excel = tmp_output / "report.xlsx"
