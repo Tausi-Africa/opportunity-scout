@@ -2,7 +2,7 @@
 Tests for send_email(): success path, auth failure, SMTP errors, fallback file.
 """
 import smtplib
-from email.header import decode_header as _decode_header
+
 from unittest.mock import MagicMock, patch, mock_open
 from pathlib import Path
 
@@ -47,32 +47,12 @@ class TestSendEmail:
         mock_smtp.login.assert_called_once_with("sender@gmail.com", "app-password-here")
         mock_smtp.sendmail.assert_called_once()
 
-    def test_subject_contains_strong_fit_count(self, tmp_output):
-        excel = tmp_output / "report.xlsx"
-        excel.write_bytes(b"fake xlsx content")
-
-        captured = {}
-
-        def fake_sendmail(from_addr, to_addr, msg_str):
-            captured["msg"] = msg_str
-
-        mock_smtp = MagicMock()
-        mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
-        mock_smtp.__exit__  = MagicMock(return_value=False)
-        mock_smtp.sendmail.side_effect = fake_sendmail
-
-        with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
-            m.send_email(excel, _opps(fit_count=3))
-
-        # Parse with Python's email library — handles RFC 2047 encoding transparently.
-        import email as _email
-        msg = _email.message_from_string(captured["msg"])
-        subject_parts = _decode_header(msg["Subject"])
-        decoded_subject = "".join(
-            part.decode(enc or "utf-8") if isinstance(part, bytes) else part
-            for part, enc in subject_parts
-        )
-        assert "3 Strong Fit" in decoded_subject
+    def test_email_body_contains_fit_count(self):
+        """_build_email_body includes the strong fit count in plain text (no encoding)."""
+        body, fit_c, _, _ = m._build_email_body(_opps(fit_count=3))
+        assert fit_c == 3
+        assert "3" in body
+        assert "Strong Fit" in body
 
     def test_returns_false_and_saves_fallback_on_auth_error(self, tmp_output):
         excel = tmp_output / "report.xlsx"

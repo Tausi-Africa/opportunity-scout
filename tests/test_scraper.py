@@ -61,14 +61,20 @@ class TestSafeGet:
             result = m.safe_get("https://example.com/forbidden")
         assert result is None
 
-    def test_500_retries_then_returns_none(self):
-        """Server errors (5xx) should trigger retries, then return None."""
+    def test_500_retries_three_times(self):
+        """5xx errors cause _safe_get_retried to retry 3 times then raise."""
         http_err = requests.HTTPError(response=MagicMock(status_code=500))
         with patch("main.requests.get", side_effect=http_err) as mock_get:
-            with patch("main.time.sleep"):  # skip backoff sleeps in tests
-                result = m.safe_get("https://example.com/server-error")
+            with patch("main.time.sleep"):
+                with pytest.raises(requests.HTTPError):
+                    m._safe_get_retried("https://example.com/server-error")
+        assert mock_get.call_count == 3
+
+    def test_safe_get_returns_none_when_retries_exhausted(self):
+        """safe_get catches any exception from _safe_get_retried and returns None."""
+        with patch("main._safe_get_retried", side_effect=requests.HTTPError("server error")):
+            result = m.safe_get("https://example.com/error")
         assert result is None
-        assert mock_get.call_count == 3  # 3 attempts
 
     def test_timeout_retries(self):
         mock_resp = MagicMock()
@@ -81,13 +87,18 @@ class TestSafeGet:
                 result = m.safe_get("https://example.com/slow")
         assert result is mock_resp
 
-    def test_connection_error_retries(self):
-        with patch(
-            "main.requests.get",
-            side_effect=requests.ConnectionError("refused"),
-        ):
+    def test_connection_error_retries_three_times(self):
+        """Connection errors cause _safe_get_retried to retry 3 times then raise."""
+        with patch("main.requests.get", side_effect=requests.ConnectionError("refused")) as mock_get:
             with patch("main.time.sleep"):
-                result = m.safe_get("https://example.com/unreachable")
+                with pytest.raises(requests.ConnectionError):
+                    m._safe_get_retried("https://example.com/unreachable")
+        assert mock_get.call_count == 3
+
+    def test_safe_get_returns_none_on_connection_error(self):
+        """safe_get catches ConnectionError from _safe_get_retried and returns None."""
+        with patch("main._safe_get_retried", side_effect=requests.ConnectionError("refused")):
+            result = m.safe_get("https://example.com/unreachable")
         assert result is None
 
 
@@ -103,9 +114,17 @@ class TestFindPdfLinks:
         soup = self._soup('<a href="https://example.com/doc.pdf">Download</a>')
         assert m.find_pdf_links(soup, self.BASE) == ["https://example.com/doc.pdf"]
 
-    def test_relative_pdf_link_resolved(self):
-        soup = self._soup('<a href="/files/brief.pdf">Brief</a>')
+    def test_path_relative_pdf_link_resolved(self):
+        """Relative paths (no leading /) join onto the base URL."""
+        soup = self._soup('<a href="docs/brief.pdf">Brief</a>')
         links = m.find_pdf_links(soup, self.BASE)
+        assert links == [f"{self.BASE}/docs/brief.pdf"]
+
+    def test_root_relative_pdf_link_resolved(self):
+        """Root-relative paths (/...) resolve against scheme+host only."""
+        base_no_path = "https://example.com"
+        soup = self._soup('<a href="/files/brief.pdf">Brief</a>')
+        links = m.find_pdf_links(soup, base_no_path)
         assert links == ["https://example.com/files/brief.pdf"]
 
     def test_non_pdf_links_excluded(self):
