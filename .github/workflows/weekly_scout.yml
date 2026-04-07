@@ -84,6 +84,54 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Verify secrets are set
+        env:
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          SENDER_EMAIL:        ${{ secrets.SENDER_EMAIL }}
+          SENDER_APP_PASSWORD: ${{ secrets.SENDER_APP_PASSWORD }}
+        run: |
+          MISSING=()
+          [ -z "$ANTHROPIC_API_KEY" ]   && MISSING+=("ANTHROPIC_API_KEY")
+          [ -z "$SENDER_EMAIL" ]        && MISSING+=("SENDER_EMAIL")
+          [ -z "$SENDER_APP_PASSWORD" ] && MISSING+=("SENDER_APP_PASSWORD")
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "ERROR: The following secrets are not set in this repository:"
+            for s in "${MISSING[@]}"; do echo "  • $s"; done
+            echo ""
+            echo "Go to: GitHub repo → Settings → Secrets and variables → Actions → New repository secret"
+            exit 1
+          fi
+
+          echo "All secrets present:"
+          echo "  ANTHROPIC_API_KEY   : ${#ANTHROPIC_API_KEY} chars (starts with ${ANTHROPIC_API_KEY:0:10}...)"
+          echo "  SENDER_EMAIL        : $SENDER_EMAIL"
+          echo "  SENDER_APP_PASSWORD : ${#SENDER_APP_PASSWORD} chars"
+
+      - name: Test Claude API connectivity
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo "=== DNS resolution ==="
+          nslookup api.anthropic.com || true
+          echo ""
+          echo "=== Minimal Claude API call ==="
+          HTTP_RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d '{"model":"claude-haiku-4-5-20251001","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}' \
+            https://api.anthropic.com/v1/messages)
+          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
+          BODY=$(echo "$HTTP_RESPONSE" | grep -v "HTTP_STATUS:")
+          echo "Status: $HTTP_STATUS"
+          echo "Body: $BODY"
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "ERROR: Claude API returned HTTP $HTTP_STATUS — check ANTHROPIC_API_KEY secret"
+            exit 1
+          fi
+          echo "Claude API connectivity: OK"
+
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
 

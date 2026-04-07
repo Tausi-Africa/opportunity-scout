@@ -50,7 +50,11 @@ MODEL           = "claude-sonnet-4-6"
 _api_key = os.getenv("ANTHROPIC_API_KEY")
 if not _api_key:
     log.warning("ANTHROPIC_API_KEY not set — Claude features will fail")
-CLAUDE_CLIENT = anthropic.Anthropic(api_key=_api_key or "missing")
+CLAUDE_CLIENT = anthropic.Anthropic(
+    api_key=_api_key or "missing",
+    timeout=60.0,        # seconds per request
+    max_retries=2,       # Anthropic SDK-level retries before raising
+)
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; BSA-Scout/1.0; +https://bsa.ai)"}
 TIMEOUT = 30
