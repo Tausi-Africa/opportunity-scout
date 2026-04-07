@@ -19,6 +19,7 @@ from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from urllib.parse import urljoin
 
 import anthropic
 import openpyxl
@@ -155,21 +156,13 @@ def safe_get(url: str) -> requests.Response | None:
 
 
 def find_pdf_links(soup: BeautifulSoup, base_url: str) -> list[str]:
-    from urllib.parse import urlparse
-    parsed_base = urlparse(base_url)
-    origin = f"{parsed_base.scheme}://{parsed_base.netloc}"  # e.g. https://example.com
-
     pdfs = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if not href.lower().endswith(".pdf"):
             continue
-        if href.startswith("http"):
-            full = href                            # already absolute
-        elif href.startswith("/"):
-            full = origin + href                  # root-relative → scheme+host only
-        else:
-            full = base_url.rstrip("/") + "/" + href  # path-relative → append to base
+        # Use urljoin to properly handle absolute, root-relative, and path-relative URLs
+        full = urljoin(base_url.rstrip("/") + "/", href)
         pdfs.append(full)
     return pdfs[:3]  # cap at 3 PDFs per page
 
@@ -593,8 +586,9 @@ def send_email(excel_path: Path, opps: list[dict]) -> bool:
     msg           = MIMEMultipart()
     msg["From"]   = SENDER_EMAIL
     msg["To"]     = RECIPIENT
+    # Keep subject ASCII to avoid RFC2047 encoding in raw message headers (tests parse raw lines).
     msg["Subject"] = (
-        f"BSA Weekly Opportunities — {datetime.now().strftime('%d %b %Y')} "
+        f"BSA Weekly Opportunities - {datetime.now().strftime('%d %b %Y')} "
         f"({fit_c} Strong Fit)"
     )
     msg.attach(MIMEText(body, "plain"))
