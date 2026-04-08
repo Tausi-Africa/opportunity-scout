@@ -49,6 +49,38 @@ class TestSendEmail:
         mock_smtp.login.assert_called_once_with("sender@gmail.com", "app-password-here")
         mock_smtp.sendmail.assert_called_once()
 
+    def test_subject_sanitised_when_opp_count_is_multiline_markdown(self, tmp_output):
+        """Claude sometimes returns multi-line markdown in <opportunities_found> — must not
+        end up in the Subject header (causes HeaderWriteError)."""
+        csv_path = tmp_output / "report.csv"
+        csv_path.write_text("col1,col2\nval1,val2")
+
+        messy_count = (
+            "**Total Opportunities Identified: 12**\n"
+            "(Including both currently open/active opportunities and recently\n"
+            "closed or rolling opportunities)"
+        )
+
+        captured = {}
+
+        def fake_sendmail(from_addr, to_addr, msg_str):
+            captured["raw"] = msg_str
+
+        mock_smtp = MagicMock()
+        mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
+        mock_smtp.__exit__ = MagicMock(return_value=False)
+        mock_smtp.sendmail.side_effect = fake_sendmail
+
+        with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
+            result = m.send_email(csv_path, "summary", "findings", messy_count)
+
+        assert result is True
+        # Subject header must be a single line with no embedded newlines
+        raw = captured["raw"]
+        subject_line = next(line for line in raw.splitlines() if line.startswith("Subject:"))
+        assert "\n" not in subject_line
+        assert "12" in subject_line
+
     def test_csv_file_attached(self, tmp_output):
         csv_path = tmp_output / "report.csv"
         csv_path.write_text("col1,col2\nval1,val2")

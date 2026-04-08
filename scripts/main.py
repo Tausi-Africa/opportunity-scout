@@ -256,12 +256,15 @@ def send_email(csv_path: Path, summary: str, key_findings: str, opp_count: str) 
 
     body = _build_email_body(summary, key_findings, opp_count)
 
+    # Sanitise opp_count: Claude may return multi-line markdown — extract just the number.
+    count_clean = re.sub(r"[^\d]", "", opp_count.split("\n")[0]) or opp_count.split("\n")[0][:20]
+
     msg           = MIMEMultipart()
     msg["From"]   = SENDER_EMAIL
     msg["To"]     = RECIPIENT
     msg["Subject"] = (
         f"BSA Weekly Opportunities - {datetime.now().strftime('%d %b %Y')} "
-        f"({opp_count} found)"
+        f"({count_clean} found)"
     )
     msg.attach(MIMEText(body, "plain"))
 
