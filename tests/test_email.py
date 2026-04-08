@@ -16,6 +16,12 @@ def patch_credentials(monkeypatch):
 
 
 class TestBuildEmailBody:
+    def test_returns_valid_html(self):
+        body = m._build_email_body("Sources searched.", "1. FSDT RFP", "7")
+        assert "<!DOCTYPE html>" in body
+        assert "<html" in body
+        assert "</html>" in body
+
     def test_contains_opportunity_count(self):
         body = m._build_email_body("Sources searched.", "1. FSDT RFP", "7")
         assert "7" in body
@@ -28,9 +34,20 @@ class TestBuildEmailBody:
         body = m._build_email_body("Searched 14 portals.", "Finding 1", "5")
         assert "Searched 14 portals." in body
 
-    def test_greets_alex(self):
+    def test_escapes_special_characters(self):
+        body = m._build_email_body("A & B", "Score > 90% for <Data>", "3")
+        assert "&amp;" in body
+        assert "&gt;" in body
+        assert "&lt;" in body
+        assert "<Data>" not in body  # raw tag must not appear unescaped
+
+    def test_bold_markdown_converted_to_strong(self):
+        body = m._build_email_body("Summary.", "**High Priority**: FSDT RFP", "2")
+        assert "<strong>High Priority</strong>" in body
+
+    def test_greets_with_scout_branding(self):
         body = m._build_email_body("Summary.", "Findings.", "2")
-        assert "Alex" in body
+        assert "AfroPavo Analytics" in body
 
 
 class TestSendEmail:

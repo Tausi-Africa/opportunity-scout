@@ -5,6 +5,7 @@ Single Claude call with web search → CSV export → email.
 Run: python scripts/main.py
 """
 
+import html
 import logging
 import os
 import re
@@ -40,7 +41,7 @@ client = anthropic.Anthropic(
 )
 
 PROMPT_TEMPLATE = """\
-You will be acting as a research assistant tasked with finding consulting opportunities \
+You will be acting as a highly experienced research assistant tasked with finding consulting opportunities \
 (Expressions of Interest/EOIs and Requests for Proposals/RFPs) relevant to a company's \
 profile in Tanzania. Your goal is to search the web, extract relevant information, and \
 compile it into a structured CSV format.
@@ -71,6 +72,8 @@ Your task involves the following steps:
    - Look for government procurement portals, development agency websites, NGO opportunity \
 pages, and consulting tender platforms
    - Focus on opportunities that match the company profile's expertise and capabilities
+   - Use a variety of search terms and filters to find the most relevant and up-to-date opportunities
+   - Also search for these opportunities in Linkedin posts , twitter and instagram posts, and other social media channels where they may be shared by organizations or individuals in the Tanzanian consulting ecosystem
 
 2. INFORMATION EXTRACTION:
    For each opportunity you find, extract the following information:
@@ -233,19 +236,138 @@ def save_csv(csv_content: str, path: Path) -> None:
 
 
 # ── Emailer ───────────────────────────────────────────────────────────────────
+def _md_to_html(text: str) -> str:
+    """Convert basic markdown (bold, bullet lists, line breaks) to HTML and escape all entities."""
+    escaped = html.escape(text)
+    # Bold: **text** or *text*
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"\*(.+?)\*",     r"<em>\1</em>", escaped)
+    # Numbered / bullet list items — each becomes an <li>
+    lines = escaped.splitlines()
+    html_lines = []
+    in_list = False
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^(\d+\.|[-•*])\s+", stripped):
+            if not in_list:
+                html_lines.append("<ul style='margin:6px 0;padding-left:20px;'>")
+                in_list = True
+            item = re.sub(r"^(\d+\.|[-•*])\s+", "", stripped)
+            html_lines.append(f"  <li style='margin:3px 0;'>{item}</li>")
+        else:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            if stripped:
+                html_lines.append(f"<p style='margin:4px 0;'>{line}</p>")
+    if in_list:
+        html_lines.append("</ul>")
+    return "\n".join(html_lines)
+
+
 def _build_email_body(summary: str, key_findings: str, opp_count: str) -> str:
-    return (
-        f"Hi Alex,\n\n"
-        f"Your weekly Tanzania consulting opportunity scan is complete.\n\n"
-        f"{'━' * 42}\n"
-        f" WEEKLY SUMMARY — {datetime.now().strftime('%d %B %Y')}\n"
-        f"{'━' * 42}\n"
-        f" Opportunities found: {opp_count}\n\n"
-        f"KEY FINDINGS:\n{key_findings}\n\n"
-        f"SEARCH SUMMARY:\n{summary}\n\n"
-        f"Full details in the attached CSV.\n\n"
-        f"Best regards,\nBSA Opportunity Scout\n"
-    )
+    """Return a self-contained HTML email string."""
+    date_str      = html.escape(datetime.now().strftime("%d %B %Y"))
+    count_escaped = html.escape(opp_count.strip())
+    summary_html  = _md_to_html(summary)
+    findings_html = _md_to_html(key_findings)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BSA Weekly Opportunities</title>
+</head>
+<body style="margin:0;padding:0;background:#f4f6f9;font-family:Arial,Helvetica,sans-serif;color:#222;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f9;padding:24px 0;">
+    <tr><td align="center">
+      <table width="620" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:8px;overflow:hidden;
+                    box-shadow:0 2px 8px rgba(0,0,0,.08);">
+
+        <!-- Header -->
+        <tr>
+          <td style="background:#1a3a5c;padding:28px 32px;">
+            <p style="margin:0;font-size:11px;color:#8ab4d8;letter-spacing:1px;text-transform:uppercase;">
+              AfroPavo Analytics
+            </p>
+            <h1 style="margin:6px 0 0;font-size:22px;color:#ffffff;font-weight:700;">
+              Weekly Opportunity Scout
+            </h1>
+            <p style="margin:4px 0 0;font-size:13px;color:#a8c8e8;">{date_str}</p>
+          </td>
+        </tr>
+
+        <!-- Summary banner -->
+        <tr>
+          <td style="background:#e8f0fe;padding:16px 32px;border-bottom:1px solid #d0ddf5;">
+            <p style="margin:0;font-size:14px;color:#1a3a5c;">
+              Your weekly Tanzania consulting opportunity scan is complete.
+            </p>
+            <p style="margin:8px 0 0;font-size:22px;font-weight:700;color:#1a3a5c;">
+              {count_escaped}
+              <span style="font-size:14px;font-weight:400;color:#555;"> opportunities found</span>
+            </p>
+          </td>
+        </tr>
+
+        <!-- Key Findings -->
+        <tr>
+          <td style="padding:24px 32px 12px;">
+            <h2 style="margin:0 0 12px;font-size:15px;font-weight:700;color:#1a3a5c;
+                        text-transform:uppercase;letter-spacing:.5px;
+                        border-bottom:2px solid #1a3a5c;padding-bottom:6px;">
+              Key Findings
+            </h2>
+            <div style="font-size:14px;line-height:1.7;color:#333;">
+              {findings_html}
+            </div>
+          </td>
+        </tr>
+
+        <!-- Search Summary -->
+        <tr>
+          <td style="padding:12px 32px 24px;">
+            <h2 style="margin:0 0 12px;font-size:15px;font-weight:700;color:#1a3a5c;
+                        text-transform:uppercase;letter-spacing:.5px;
+                        border-bottom:2px solid #e0e0e0;padding-bottom:6px;">
+              Search Summary
+            </h2>
+            <div style="font-size:13px;line-height:1.7;color:#555;">
+              {summary_html}
+            </div>
+          </td>
+        </tr>
+
+        <!-- Attachment note -->
+        <tr>
+          <td style="padding:0 32px 24px;">
+            <p style="margin:0;padding:14px 18px;background:#f0f7ee;border-left:4px solid #2e7d32;
+                       border-radius:4px;font-size:13px;color:#2e7d32;">
+              &#128206; Full details including deadlines, budgets, eligibility, and direct links
+              are in the attached CSV file.
+            </p>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f8f9fa;padding:16px 32px;border-top:1px solid #e0e0e0;">
+            <p style="margin:0;font-size:12px;color:#888;text-align:center;">
+              BSA Opportunity Scout &nbsp;|&nbsp; AfroPavo Analytics &nbsp;|&nbsp;
+              <a href="https://www.afropavoanalytics.com" style="color:#1a3a5c;text-decoration:none;">
+                afropavoanalytics.com
+              </a>
+            </p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
 
 
 def send_email(csv_path: Path, summary: str, key_findings: str, opp_count: str) -> bool:
@@ -254,19 +376,19 @@ def send_email(csv_path: Path, summary: str, key_findings: str, opp_count: str) 
         log.warning("Email credentials not set (SENDER_EMAIL / SENDER_APP_PASSWORD) — skipping email")
         return False
 
-    body = _build_email_body(summary, key_findings, opp_count)
-
-    # Sanitise opp_count: Claude may return multi-line markdown — extract just the number.
+    # Sanitise opp_count for Subject: extract just the number from any markdown/multiline text.
     count_clean = re.sub(r"[^\d]", "", opp_count.split("\n")[0]) or opp_count.split("\n")[0][:20]
 
-    msg           = MIMEMultipart()
+    html_body = _build_email_body(summary, key_findings, opp_count)
+
+    msg           = MIMEMultipart("mixed")
     msg["From"]   = SENDER_EMAIL
     msg["To"]     = RECIPIENT
     msg["Subject"] = (
         f"BSA Weekly Opportunities - {datetime.now().strftime('%d %b %Y')} "
         f"({count_clean} found)"
     )
-    msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     with open(csv_path, "rb") as f:
         part = MIMEBase("application", "octet-stream")
