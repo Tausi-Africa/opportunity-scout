@@ -1,586 +1,275 @@
 #!/usr/bin/env python3
 """
 BSA Opportunity Scout — main.py
-Full pipeline: discover sources → scrape → parse PDFs → assess fit → build Excel → email
+Single Claude call with web search → CSV export → email.
 Run: python scripts/main.py
 """
 
-import functools
-import io
-import json
 import logging
 import os
 import re
 import smtplib
-import time
 from datetime import datetime
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from urllib.parse import urljoin
 
-import ollama
-import openpyxl
-import pdfplumber
-import requests
-from bs4 import BeautifulSoup
+import anthropic
 from dotenv import load_dotenv
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Config ───────────────────────────────────────────────────────────────────
-COMPANY_PROFILE = Path(__file__).parent.parent / "knowledgebase" / "company_profile.txt"
-OUTPUT_DIR      = Path(__file__).parent.parent / "output"
+# ── Config ────────────────────────────────────────────────────────────────────
+BASE_DIR        = Path(__file__).parent.parent
+COMPANY_PROFILE = BASE_DIR / "knowledgebase" / "company_profile.txt"
+ADDITIONAL_URLS = BASE_DIR / "knowledgebase" / "additional_urls.txt"
+OUTPUT_DIR      = BASE_DIR / "output"
 RECIPIENT       = "alex@bsa.ai"
 SENDER_EMAIL    = os.getenv("SENDER_EMAIL")
 SENDER_PASS     = os.getenv("SENDER_APP_PASSWORD")
-MODEL           = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
-OLLAMA_HOST     = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+MODEL           = "claude-sonnet-4-6"
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; BSA-Scout/1.0; +https://bsa.ai)"}
-TIMEOUT = 30
+client = anthropic.Anthropic(
+    api_key=os.getenv("ANTHROPIC_API_KEY"),
+    timeout=300.0,
+    max_retries=2,
+)
 
-KEYWORDS = [
-    "research", "data", "analytics", "finance", "credit", "digital", "facilitation",
-    "consulting", "advisory", "technical assistance", "fintech", "financial inclusion",
-    "capacity building", "monitoring", "evaluation", "ict", "information systems",
-    "software", "database", "survey", "assessment", "study", "feasibility",
-    "artificial intelligence", "machine learning", "blockchain", "risk management",
-]
+PROMPT_TEMPLATE = """\
+You will be acting as a research assistant tasked with finding consulting opportunities \
+(Expressions of Interest/EOIs and Requests for Proposals/RFPs) relevant to a company's \
+profile in Tanzania. Your goal is to search the web, extract relevant information, and \
+compile it into a structured CSV format.
 
-# JS-heavy domains — use Playwright
-_JS_DOMAINS = ["worldbank", "europa.eu", "ungm", "afdb.org", "undp", "unicef", "ausschreibungen"]
+Here is the company profile you should use to assess relevance of opportunities:
 
-SITES: list[dict] = [
-    {"name": "UNGM",         "url": "https://www.ungm.org/Public/Notice",                                                                                    "country_filter": "Tanzania", "use_playwright": True},
-    {"name": "World Bank",   "url": "https://projects.worldbank.org/en/projects-operations/opportunities?srce=both&project_ctry_name_exact=Tanzania",         "country_filter": None,       "use_playwright": True},
-    {"name": "EU Tenders",   "url": "https://ec.europa.eu/info/funding-tenders/opportunities/portal/screen/opportunities/calls-for-tenders?isExactMatch=true&order=DESC&pageNumber=1&pageSize=50&sortBy=startDate", "country_filter": "Tanzania", "use_playwright": True},
-    {"name": "US Embassy TZ","url": "https://tz.usembassy.gov/contract-opportunities/",                                                                       "country_filter": None,       "use_playwright": False},
-    {"name": "AfDB",         "url": "https://www.afdb.org/en/projects-and-operations/procurement",                                                            "country_filter": "Tanzania", "use_playwright": True},
-    {"name": "GIZ Tanzania", "url": "https://www.giz.de/en/regions/africa/tanzania/tenders",                                                                  "country_filter": None,       "use_playwright": False},
-    {"name": "DG Market",    "url": "https://www.dgmarket.com/tenders/list.do?sub=services-in-Tanzania-2&locationISO=tz",                                     "country_filter": None,       "use_playwright": False},
-    {"name": "FSDT",         "url": "https://www.fsdt.or.tz/work-with-us/",                                                                                   "country_filter": None,       "use_playwright": False},
-    {"name": "CRDB Bank",    "url": "https://crdbbank.co.tz/en/about-us/tender",                                                                              "country_filter": None,       "use_playwright": False},
-    {"name": "NBC Bank",     "url": "https://www.nbc.co.tz/en/procurement/",                                                                                  "country_filter": None,       "use_playwright": False},
-    {"name": "NMB Bank",     "url": "https://www.nmbbank.co.tz/tenders",                                                                                      "country_filter": None,       "use_playwright": False},
-    {"name": "GIZ Ausschr.", "url": "https://ausschreibungen.giz.de/Satellite/company/welcome.do",                                                            "country_filter": "Tanzania", "use_playwright": True},
-    {"name": "India HC TZ",  "url": "https://hcindiatz.gov.in/tenders-tanzania.php",                                                                         "country_filter": None,       "use_playwright": False},
-]
+<company_profile>
+{company_profile}
+</company_profile>
 
-# ── Retry decorator ───────────────────────────────────────────────────────────
-def retry(max_retries: int = 3, backoff: float = 2.0, exceptions: tuple = (Exception,)):
-    """Retry a function with exponential backoff on specified exceptions."""
-    def decorator(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            last_exc: Exception | None = None
-            for attempt in range(max_retries):
-                try:
-                    return fn(*args, **kwargs)
-                except exceptions as exc:
-                    last_exc = exc
-                    if attempt < max_retries - 1:
-                        wait = backoff ** attempt
-                        log.warning(
-                            f"{fn.__name__} attempt {attempt + 1}/{max_retries} failed: {exc!r}. "
-                            f"Retrying in {wait:.1f}s..."
-                        )
-                        time.sleep(wait)
-            raise last_exc  # type: ignore[misc]
-        return wrapper
-    return decorator
+Here are some starting URLs to search (but you should not limit yourself to only these sources):
+
+<additional_urls>
+{additional_urls}
+</additional_urls>
+
+The final CSV should be sent to this email address:
+
+<email_address>
+{email_address}
+</email_address>
+
+Your task involves the following steps:
+
+1. SEARCH STRATEGY:
+   - Search for consulting opportunities, EOIs, and RFPs specifically for Tanzania
+   - Use the provided URLs as starting points but expand your search to other relevant sources
+   - Look for government procurement portals, development agency websites, NGO opportunity \
+pages, and consulting tender platforms
+   - Focus on opportunities that match the company profile's expertise and capabilities
+
+2. INFORMATION EXTRACTION:
+   For each opportunity you find, extract the following information:
+   - Opportunity title/name
+   - Type (EOI, RFP, tender, etc.)
+   - Organization/client posting the opportunity
+   - Direct link/URL to the opportunity
+   - Contact information (email, phone, contact person if available)
+   - Submission deadline
+   - Qualification criteria/requirements (if specified)
+   - Brief description of the opportunity
+   - Relevance score to company profile (High/Medium/Low)
+
+3. DOCUMENT HANDLING:
+   - If opportunities are posted as PDFs or other document formats, read and extract the \
+relevant information from these documents
+   - Pay special attention to eligibility criteria, scope of work, and submission requirements \
+within PDFs
+   - Extract contact details that may only be available within the document
+
+4. RELEVANCE ASSESSMENT:
+   - Compare each opportunity against the company profile
+   - Only include opportunities that reasonably match the company's expertise, sector focus, \
+and capabilities
+   - Note any specific qualification criteria that the company should be aware of
+
+Before compiling your results, use the scratchpad below to plan your search approach:
+
+<scratchpad>
+- List the key sectors/expertise from the company profile
+- Identify the most relevant search terms and sources
+- Plan which websites and portals to prioritize
+</scratchpad>
+
+5. OUTPUT FORMAT:
+   Compile all opportunities into a CSV file with the following columns:
+   - Opportunity_Title
+   - Type
+   - Organization
+   - URL
+   - Contact_Email
+   - Contact_Phone
+   - Contact_Person
+   - Deadline
+   - Qualification_Criteria
+   - Description
+   - Relevance_Score
+   - Date_Found
+
+   Ensure the CSV is properly formatted with:
+   - Headers in the first row
+   - Each opportunity in a separate row
+   - Commas as delimiters
+   - Text fields enclosed in quotes if they contain commas
+   - Date format as YYYY-MM-DD for deadlines
+
+6. FINAL DELIVERABLE:
+   Your response should include:
+   - A summary of your search process and sources consulted
+   - The total number of opportunities found
+   - A brief analysis of the most promising opportunities
+   - The complete CSV data
+
+Present your final output in the following format:
+
+<search_summary>
+[Describe your search process, sources used, and any challenges encountered]
+</search_summary>
+
+<opportunities_found>
+[State the total number of opportunities identified]
+</opportunities_found>
+
+<key_findings>
+[Highlight 3-5 most relevant/promising opportunities with brief explanations]
+</key_findings>
+
+<csv_data>
+[Insert the complete CSV data here, properly formatted]
+</csv_data>
+
+<email_instructions>
+Confirm that this CSV should be sent to {email_address}
+</email_instructions>
+
+Note: Your final output should contain the complete CSV data ready to be saved as a file \
+and emailed. Ensure all information is accurate and up-to-date, with working URLs and \
+valid contact information wherever possible.\
+"""
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── File loaders ──────────────────────────────────────────────────────────────
 def load_profile() -> str:
     if not COMPANY_PROFILE.exists():
-        raise FileNotFoundError(
-            f"company_profile.txt not found at {COMPANY_PROFILE.resolve()}. "
-            "Ensure knowledgebase/company_profile.txt exists."
-        )
+        raise FileNotFoundError(f"company_profile.txt not found at {COMPANY_PROFILE.resolve()}")
     text = COMPANY_PROFILE.read_text(encoding="utf-8").strip()
     if not text:
         raise ValueError("company_profile.txt is empty.")
     return text
 
 
-def is_relevant(text: str) -> bool:
-    t = text.lower()
-    return any(kw in t for kw in KEYWORDS)
-
-
-@retry(max_retries=3, backoff=2.0, exceptions=(requests.RequestException, OSError))
-def _safe_get_retried(url: str) -> requests.Response | None:
-    """
-    Inner HTTP GET — retried up to 3× on transient failures.
-    Returns None for permanent 4xx errors (no retry). Raises on 5xx / timeouts
-    so the retry decorator can catch and retry them.
-    """
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        r.raise_for_status()
-        return r
-    except requests.HTTPError as e:
-        status = getattr(getattr(e, "response", None), "status_code", None)
-        if status in (403, 404, 410):
-            log.warning(f"Permanent HTTP {status} for {url} — skipping (no retry)")
-            return None  # return None → retry decorator sees success, stops retrying
-        raise  # 5xx → retry decorator catches and retries
-
-
-def safe_get(url: str) -> requests.Response | None:
-    """
-    HTTP GET with automatic retry. Always returns None on failure — never raises.
-    Callers can treat None as "this URL is unavailable".
-    """
-    try:
-        return _safe_get_retried(url)
-    except Exception as e:
-        log.warning(f"GET failed for {url} after retries: {e!r}")
-        return None
-
-
-def find_pdf_links(soup: BeautifulSoup, base_url: str) -> list[str]:
-    pdfs = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not href.lower().endswith(".pdf"):
-            continue
-        # Use urljoin to properly handle absolute, root-relative, and path-relative URLs
-        full = urljoin(base_url.rstrip("/") + "/", href)
-        pdfs.append(full)
-    return pdfs[:3]  # cap at 3 PDFs per page
-
-
-def parse_pdf(url: str) -> str:
-    """Download and extract text from a PDF. Returns empty string on any failure."""
-    r = safe_get(url)
-    if not r:
+def load_additional_urls() -> str:
+    if not ADDITIONAL_URLS.exists():
+        log.warning("additional_urls.txt not found — Claude will search without seed URLs")
         return ""
-    try:
-        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
-            pages_text = [p.extract_text() or "" for p in pdf.pages]
-        return "\n".join(pages_text)[:6000]
-    except Exception as e:
-        log.warning(f"PDF parse failed for {url}: {e}")
-        return ""
+    return ADDITIONAL_URLS.read_text(encoding="utf-8").strip()
 
 
-# ── Scraper ───────────────────────────────────────────────────────────────────
-def _passes_country_filter(site: dict, anchor, href: str) -> bool:
-    cf = site.get("country_filter")
-    if not cf:
-        return True
-    parent_text = anchor.parent.get_text(" ", strip=True).lower() if anchor.parent else ""
-    return cf.lower() in parent_text or cf.lower() in href.lower()
+# ── Response helpers ──────────────────────────────────────────────────────────
+def extract_section(text: str, tag: str) -> str:
+    """Extract content between <tag>…</tag>. Returns '' if not found."""
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+    return match.group(1).strip() if match else ""
 
 
-def _fetch_detail(full_url: str) -> tuple[str, str]:
-    """Return (detail_text, pdf_text) for a detail/opportunity page."""
-    detail_r = safe_get(full_url)
-    if not detail_r:
-        return "", ""
-    detail_soup = BeautifulSoup(detail_r.text, "html.parser")
-    detail_text = detail_soup.get_text(" ", strip=True)[:4000]
-    pdf_text    = "".join(parse_pdf(u) for u in find_pdf_links(detail_soup, full_url))
-    return detail_text, pdf_text
+def _get_full_text(response: anthropic.types.Message) -> str:
+    """Concatenate all text blocks from the assistant response."""
+    parts = []
+    for block in response.content:
+        if hasattr(block, "text") and block.text:
+            parts.append(block.text)
+    return "\n".join(parts)
 
 
-def _get_page_html(site: dict) -> str:
+# ── Scout ─────────────────────────────────────────────────────────────────────
+def scout(profile: str, additional_urls: str) -> str:
     """
-    Fetch page HTML. Uses Playwright for JS-heavy sites (use_playwright=True),
-    falling back to requests if Playwright is unavailable or fails.
+    Call Claude with the research prompt and web search tool.
+    Returns the full assistant response text.
     """
-    if PLAYWRIGHT_AVAILABLE and site.get("use_playwright"):
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page(extra_http_headers=HEADERS)
-                page.goto(site["url"], wait_until="networkidle", timeout=30_000)
-                html = page.content()
-                browser.close()
-                return html
-        except Exception as e:
-            log.warning(
-                f"Playwright failed for {site['name']}: {e}. "
-                "Falling back to requests (may miss JS-rendered content)."
-            )
-    r = safe_get(site["url"])
-    return r.text if r else ""
-
-
-def scrape_site(site: dict) -> list[dict]:
-    """Scrape a single portal, returning relevant opportunity dicts."""
-    log.info(f"Scraping {site['name']} ...")
-    html = _get_page_html(site)
-    if not html:
-        log.warning(f"No HTML retrieved from {site['name']} — skipping")
-        return []
-
-    soup  = BeautifulSoup(html, "html.parser")
-    found: list[dict] = []
-    seen:  set[str]   = set()
-
-    for anchor in soup.find_all("a", href=True):
-        title = anchor.get_text(strip=True)
-        href  = anchor["href"]
-
-        if not title or len(title) < 10 or href in seen:
-            continue
-        if not is_relevant(title):
-            continue
-        if not _passes_country_filter(site, anchor, href):
-            continue
-
-        full_url = href if href.startswith("http") else site["url"].rstrip("/") + "/" + href.lstrip("/")
-        seen.add(href)
-
-        detail_text, pdf_text = _fetch_detail(full_url)
-        if not detail_text:
-            detail_text = title
-
-        raw_text = (detail_text + "\n\nPDF CONTENT:\n" + pdf_text) if pdf_text else detail_text
-        found.append({
-            "source":     site["name"],
-            "source_url": full_url,
-            "title":      title,
-            "raw_text":   raw_text,
-        })
-        time.sleep(0.8)
-
-    log.info(f"  → {len(found)} relevant items from {site['name']}")
-    return found
-
-
-# ── Local model source discovery ─────────────────────────────────────────────
-DISCOVER_PROMPT = """\
-You are helping a Tanzanian data analytics and fintech consulting firm find procurement portals.
-
-Company profile summary:
-{profile}
-
-Based on your knowledge, list procurement portals, tender pages, and consulting opportunity
-listings that cover Tanzania in these service areas:
-- Data analytics, research, AI/machine learning
-- Finance, fintech, credit scoring
-- Capacity building, facilitation, training
-- Monitoring & evaluation, digital transformation
-- ICT and information systems
-
-Include direct URLs to tenders/opportunities listing pages for:
-1. UN agency Tanzania procurement portals (UNDP, UNICEF, WHO, FAO, ILO, UN Women, UNOPS)
-2. Tanzania government portals (PPRA, Ministry of Finance, TANESCO, TRA, NBS)
-3. Bilateral donors (KfW, SIDA, FCDO, USAID, GIZ sub-portals, Danida, JICA)
-4. East Africa development banks and foundations (Aga Khan Foundation, MasterCard Foundation)
-5. Private sector banks and companies in Tanzania posting tenders
-
-Return ONLY a valid JSON array — no explanation, no markdown:
-[{{"name": "Portal Name", "url": "https://direct-url-to-tenders", "country_filter": null}}]
-"""
-
-
-def discover_sources(profile: str, existing_urls: set[str]) -> list[dict]:
-    """
-    Use the local Ollama model to suggest new Tanzania consulting opportunity portals.
-    Returns a list of new site dicts (deduped against existing_urls).
-    Gracefully returns [] on any failure.
-    """
-    log.info("Asking local model to suggest new opportunity sources...")
-    try:
-        response = ollama.chat(
-            model=MODEL,
-            messages=[{
-                "role": "user",
-                "content": DISCOVER_PROMPT.format(profile=profile[:800]),
-            }],
-            options={"temperature": 0.3, "num_predict": 2000},
-        )
-        text = response.message.content.strip()
-
-        if not text:
-            log.warning("discover_sources: model returned empty response")
-            return []
-
-        # Strip markdown fences, then find JSON array
-        text = re.sub(r"(^```json\s*)|(\s*```$)", "", text, flags=re.MULTILINE).strip()
-        match = re.search(r"\[[^\]]*(?:\[[^\]]*\][^\]]*)*\]", text, re.DOTALL)
-        if not match:
-            log.warning("discover_sources: no JSON array found in model response")
-            return []
-
-        raw_sites: list = json.loads(match.group())
-
-        new_sites = []
-        for s in raw_sites:
-            if not isinstance(s, dict) or not s.get("url"):
-                continue
-            if s["url"] in existing_urls:
-                continue
-            s.setdefault("country_filter", None)
-            s.setdefault("use_playwright", any(d in s["url"] for d in _JS_DOMAINS))
-            new_sites.append(s)
-
-        log.info(f"Model suggested {len(new_sites)} new opportunity sources")
-        return new_sites
-
-    except Exception as e:
-        log.warning(f"discover_sources failed ({e!r}) — continuing with known sites only")
-        return []
-
-
-# ── Assessor ─────────────────────────────────────────────────────────────────
-ASSESS_PROMPT = """\
-You are a business development analyst for a Tanzanian consulting firm.
-Assess whether the following opportunity is a good fit for the company.
-
-COMPANY PROFILE:
-{profile}
-
-OPPORTUNITY DETAILS (title, webpage text, any PDF content):
-{opp_text}
-
-SOURCE WEBSITE: {source}
-
-Return ONLY a valid JSON object with these exact keys:
-{{
-  "title": "short clean title",
-  "organization": "issuing org name",
-  "type": "RFP | EOI | Call for Tenders | Grant | Expression of Interest | Other",
-  "sectors": ["sector1","sector2"],
-  "deadline": "DD Month YYYY or Not specified",
-  "budget": "USD X,XXX,XXX or Not specified",
-  "budget_type": "fixed | to_be_proposed | not_specified",
-  "eligibility": ["criterion 1","criterion 2","criterion 3"],
-  "fit_assessment": "fit | nearly_fit | far_fetched",
-  "fit_reasoning": "2-sentence explanation of why",
-  "contact_email": "email@domain.com or Not found",
-  "application_link": "https://... or Not found",
-  "background_context": "2-3 sentences describing what this call is about and who issued it"
-}}
-No markdown, no explanation, only JSON.
-"""
-
-_REQUIRED_KEYS = {
-    "title", "organization", "type", "sectors", "deadline", "budget",
-    "budget_type", "eligibility", "fit_assessment", "fit_reasoning",
-    "contact_email", "application_link", "background_context",
-}
-_VALID_FIT = {"fit", "nearly_fit", "far_fetched"}
-
-
-def _validate_assessment(data: dict) -> bool:
-    """Return True if the Claude JSON response has all required keys and valid values."""
-    missing = _REQUIRED_KEYS - set(data.keys())
-    if missing:
-        log.warning(f"Assessment missing keys: {missing}")
-        return False
-    if data.get("fit_assessment") not in _VALID_FIT:
-        log.warning(f"Invalid fit_assessment value: '{data.get('fit_assessment')}'")
-        return False
-    if not isinstance(data.get("sectors"), list):
-        log.warning("Assessment 'sectors' is not a list — coercing")
-        data["sectors"] = [str(data.get("sectors", ""))]
-    if not isinstance(data.get("eligibility"), list):
-        log.warning("Assessment 'eligibility' is not a list — coercing")
-        data["eligibility"] = [str(data.get("eligibility", ""))]
-    return True
-
-
-def assess(opp: dict, profile: str) -> dict | None:
-    """Ask local Ollama model to assess fit for one opportunity. Returns None on failure."""
-    prompt = ASSESS_PROMPT.format(
-        profile=profile[:2000],
-        opp_text=opp["raw_text"][:4000],
-        source=opp["source"],
+    log.info("Starting Claude web search for Tanzania opportunities...")
+    prompt = PROMPT_TEMPLATE.format(
+        company_profile=profile,
+        additional_urls=additional_urls,
+        email_address=RECIPIENT,
     )
-    try:
-        response = ollama.chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.1, "num_predict": 900},
-        )
-        text = response.message.content.strip()
-        text = re.sub(r"(^```json\s*)|(\s*```$)", "", text, flags=re.MULTILINE)
-        data = json.loads(text)
 
-        if not _validate_assessment(data):
-            log.warning(f"Skipping malformed assessment for: {opp['title'][:60]}")
-            return None
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=20000,
+        temperature=1,
+        tools=[{
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 20,
+        }],
+        messages=[{"role": "user", "content": prompt}],
+    )
 
-        data["source_url"] = opp["source_url"]
-        data["source"]     = opp["source"]
-        return data
-
-    except json.JSONDecodeError as e:
-        log.warning(f"Model returned invalid JSON for '{opp['title'][:60]}': {e}")
-        return None
-    except Exception as e:
-        log.warning(f"Assessment failed for '{opp['title'][:60]}': {e!r}")
-        return None
+    log.info(f"Claude response: stop_reason={response.stop_reason}, "
+             f"input_tokens={response.usage.input_tokens}, "
+             f"output_tokens={response.usage.output_tokens}")
+    return _get_full_text(response)
 
 
-# ── Excel Builder ─────────────────────────────────────────────────────────────
-COLS = [
-    ("Title",            38), ("Organization",   22), ("Type",             14),
-    ("Sectors",          22), ("Deadline",        16), ("Budget",           18),
-    ("Budget Type",      14), ("Fit Assessment",  14), ("Fit Reasoning",    38),
-    ("Eligibility",      40), ("Contact Email",   26), ("Application Link", 30),
-    ("Background",       48), ("Source",          14), ("Source URL",       30),
-    ("Date Found",       14),
-]
-
-FIT_COLORS = {"fit": "C6EFCE", "nearly_fit": "FFEB9C", "far_fetched": "FFC7CE"}
-HEADER_BG  = "1F4E79"
-
-
-def build_excel(opps: list[dict], path: Path) -> None:
-    """Build a colour-coded Excel workbook with an Opportunities sheet and Summary sheet."""
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Opportunities"
-    ws.freeze_panes = "A2"
-
-    thin   = Side(style="thin", color="CCCCCC")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    for c, (hdr, w) in enumerate(COLS, 1):
-        cell = ws.cell(row=1, column=c, value=hdr)
-        cell.fill      = PatternFill(start_color=HEADER_BG, end_color=HEADER_BG, fill_type="solid")
-        cell.font      = Font(color="FFFFFF", bold=True, size=11)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border    = border
-        ws.column_dimensions[cell.column_letter].width = w
-    ws.row_dimensions[1].height = 28
-
-    for r, o in enumerate(opps, 2):
-        fit   = o.get("fit_assessment", "").lower()
-        color = FIT_COLORS.get(fit, "FFFFFF")
-        fill  = PatternFill(start_color=color, end_color=color, fill_type="solid")
-
-        vals = [
-            o.get("title", ""),
-            o.get("organization", ""),
-            o.get("type", ""),
-            ", ".join(o.get("sectors", [])),
-            o.get("deadline", ""),
-            o.get("budget", ""),
-            o.get("budget_type", "").replace("_", " ").title(),
-            o.get("fit_assessment", "").replace("_", " ").upper(),
-            o.get("fit_reasoning", ""),
-            "\n".join(f"• {e}" for e in o.get("eligibility", [])),
-            o.get("contact_email", ""),
-            o.get("application_link", ""),
-            o.get("background_context", ""),
-            o.get("source", ""),
-            o.get("source_url", ""),
-            datetime.now().strftime("%Y-%m-%d"),
-        ]
-        for c, val in enumerate(vals, 1):
-            cell = ws.cell(row=r, column=c, value=val)
-            cell.fill      = fill
-            cell.border    = border
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-        ws.row_dimensions[r].height = 60
-
-    # ── Summary sheet ─────────────────────────────────────────────────────────
-    ws2    = wb.create_sheet("Summary")
-    fit_c  = sum(1 for o in opps if o.get("fit_assessment") == "fit")
-    near_c = sum(1 for o in opps if o.get("fit_assessment") == "nearly_fit")
-    far_c  = sum(1 for o in opps if o.get("fit_assessment") == "far_fetched")
-
-    ws2.append(["BSA Weekly Opportunity Report", datetime.now().strftime("%d %B %Y")])
-    ws2.append([])
-    ws2.append(["Total Opportunities", len(opps)])
-    ws2.append(["Strong Fit",          fit_c])
-    ws2.append(["Nearly Fit",          near_c])
-    ws2.append(["Far Fetched",         far_c])
-    ws2.append([])
-    ws2.append(["TOP STRONG FIT OPPORTUNITIES"])
-    for o in [x for x in opps if x.get("fit_assessment") == "fit"][:8]:
-        ws2.append([o.get("title", ""), o.get("organization", ""), o.get("deadline", ""), o.get("budget", "")])
-
-    wb.save(path)
-    log.info(f"Excel saved → {path}")
+# ── CSV output ────────────────────────────────────────────────────────────────
+def save_csv(csv_content: str, path: Path) -> None:
+    path.write_text(csv_content, encoding="utf-8")
+    log.info(f"CSV saved → {path}")
 
 
 # ── Emailer ───────────────────────────────────────────────────────────────────
-def _build_email_body(opps: list[dict]) -> tuple[str, int, int, int]:
-    """Build the plain-text email body. Returns (body, fit_count, near_count, far_count)."""
-    fit_c  = sum(1 for o in opps if o.get("fit_assessment") == "fit")
-    near_c = sum(1 for o in opps if o.get("fit_assessment") == "nearly_fit")
-    far_c  = sum(1 for o in opps if o.get("fit_assessment") == "far_fetched")
-
-    top_lines = "\n".join(
-        f"  • {o.get('title','N/A')} | {o.get('organization','N/A')} "
-        f"| Deadline: {o.get('deadline','N/A')} | Budget: {o.get('budget','N/A')}"
-        for o in [x for x in opps if x.get("fit_assessment") == "fit"][:5]
-    )
-
-    body = (
+def _build_email_body(summary: str, key_findings: str, opp_count: str) -> str:
+    return (
         f"Hi Alex,\n\n"
         f"Your weekly Tanzania consulting opportunity scan is complete.\n\n"
-        f"{'━' * 38}\n"
+        f"{'━' * 42}\n"
         f" WEEKLY SUMMARY — {datetime.now().strftime('%d %B %Y')}\n"
-        f"{'━' * 38}\n"
-        f" Total scanned : {len(opps)}\n"
-        f" Strong Fit    : {fit_c}\n"
-        f" Nearly Fit    : {near_c}\n"
-        f" Far Fetched   : {far_c}\n\n"
-        f"TOP STRONG FIT OPPORTUNITIES:\n"
-        f"{top_lines if top_lines else '  None found this week.'}\n\n"
-        f"Full details in the attached Excel report (colour-coded by fit).\n\n"
+        f"{'━' * 42}\n"
+        f" Opportunities found: {opp_count}\n\n"
+        f"KEY FINDINGS:\n{key_findings}\n\n"
+        f"SEARCH SUMMARY:\n{summary}\n\n"
+        f"Full details in the attached CSV.\n\n"
         f"Best regards,\nBSA Opportunity Scout\n"
     )
-    return body, fit_c, near_c, far_c
 
 
-def _save_email_fallback(body: str, excel_path: Path) -> None:
-    """If email fails, save the body text next to the Excel file for manual review."""
-    fallback = excel_path.with_suffix(".email_body.txt")
-    fallback.write_text(body, encoding="utf-8")
-    log.info(f"Email body saved to fallback file → {fallback}")
-
-
-def send_email(excel_path: Path, opps: list[dict]) -> bool:
-    """
-    Send the weekly report email with Excel attachment.
-    Returns True on success, False on failure (failure is logged, not raised).
-    """
+def send_email(csv_path: Path, summary: str, key_findings: str, opp_count: str) -> bool:
+    """Send the weekly report email with CSV attachment. Returns True on success."""
     if not SENDER_EMAIL or not SENDER_PASS:
-        log.warning(
-            "Email credentials not configured (SENDER_EMAIL / SENDER_APP_PASSWORD). "
-            f"Skipping email — Excel saved at {excel_path}"
-        )
+        log.warning("Email credentials not set (SENDER_EMAIL / SENDER_APP_PASSWORD) — skipping email")
         return False
 
-    body, fit_c, _, _ = _build_email_body(opps)
+    body = _build_email_body(summary, key_findings, opp_count)
 
     msg           = MIMEMultipart()
     msg["From"]   = SENDER_EMAIL
     msg["To"]     = RECIPIENT
-    # Keep subject ASCII to avoid RFC2047 encoding in raw message headers (tests parse raw lines).
     msg["Subject"] = (
         f"BSA Weekly Opportunities - {datetime.now().strftime('%d %b %Y')} "
-        f"({fit_c} Strong Fit)"
+        f"({opp_count} found)"
     )
     msg.attach(MIMEText(body, "plain"))
 
-    with open(excel_path, "rb") as f:
+    with open(csv_path, "rb") as f:
         part = MIMEBase("application", "octet-stream")
         part.set_payload(f.read())
         encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{excel_path.name}"')
+        part.add_header("Content-Disposition", f'attachment; filename="{csv_path.name}"')
         msg.attach(part)
 
     try:
@@ -591,40 +280,26 @@ def send_email(excel_path: Path, opps: list[dict]) -> bool:
         return True
 
     except smtplib.SMTPAuthenticationError:
-        log.error(
-            "SMTP authentication failed. Check SENDER_EMAIL and SENDER_APP_PASSWORD. "
-            "For Gmail/Google Workspace, use an App Password (not your account password). "
-            "Enable 2FA first, then generate at myaccount.google.com/apppasswords"
-        )
-        _save_email_fallback(body, excel_path)
+        log.error("SMTP auth failed — check SENDER_EMAIL and SENDER_APP_PASSWORD (use Gmail App Password)")
         return False
-
-    except smtplib.SMTPRecipientsRefused as e:
-        log.error(f"Recipient refused by SMTP server: {e.recipients}")
-        _save_email_fallback(body, excel_path)
-        return False
-
     except smtplib.SMTPException as e:
-        log.error(f"SMTP error while sending email: {e}")
-        _save_email_fallback(body, excel_path)
+        log.error(f"SMTP error: {e}")
         return False
-
     except OSError as e:
-        log.error(f"Network error connecting to SMTP server: {e}")
-        _save_email_fallback(body, excel_path)
+        log.error(f"Network error connecting to SMTP: {e}")
         return False
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 def main() -> int:
     """
-    Full pipeline. Returns exit code: 0 = success, 1 = no opportunities found,
-    2 = profile load failure.
+    Full pipeline. Returns exit code:
+      0 = success  |  1 = no CSV extracted  |  2 = profile load failure
     """
     log.info("=== BSA Opportunity Scout starting ===")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load company profile
+    # Load inputs
     try:
         profile = load_profile()
         log.info("Company profile loaded.")
@@ -632,63 +307,41 @@ def main() -> int:
         log.error(f"Cannot load company profile: {e}")
         return 2
 
-    # Step 1 — Discover new sources with Claude web search
-    existing_urls = {s["url"] for s in SITES}
-    new_sites     = discover_sources(profile, existing_urls)
-    all_sites     = SITES + new_sites
-    if new_sites:
-        log.info(f"Added {len(new_sites)} Claude-discovered sources: {[s['name'] for s in new_sites]}")
+    additional_urls = load_additional_urls()
 
-    # Step 2 — Scrape all sites
-    raw: list[dict] = []
-    for site in all_sites:
-        try:
-            raw.extend(scrape_site(site))
-        except Exception as e:
-            log.error(f"Site '{site['name']}' failed unexpectedly: {e!r} — continuing")
-
-    log.info(f"Total raw opportunities found: {len(raw)}")
-    if not raw:
-        log.warning("No opportunities scraped. Check site connectivity and keyword list.")
-
-    # Step 3 — Deduplicate by normalised title
-    seen_titles: set[str] = set()
-    deduped: list[dict]   = []
-    for o in raw:
-        key = re.sub(r"\W+", " ", o["title"].lower()).strip()[:60]
-        if key not in seen_titles:
-            seen_titles.add(key)
-            deduped.append(o)
-    log.info(f"After deduplication: {len(deduped)} opportunities")
-
-    # Step 4 — Assess each with Claude
-    assessed: list[dict] = []
-    for i, opp in enumerate(deduped, 1):
-        log.info(f"Assessing {i}/{len(deduped)}: {opp['title'][:60]}")
-        result = assess(opp, profile)
-        if result:
-            assessed.append(result)
-
-    if not assessed:
-        log.warning("No opportunities successfully assessed.")
+    # Run Claude web search
+    try:
+        response_text = scout(profile, additional_urls)
+    except anthropic.APIConnectionError as e:
+        log.error(f"Claude API connection error: {e}")
+        return 1
+    except anthropic.APIStatusError as e:
+        log.error(f"Claude API error (HTTP {e.status_code}): {e.message}")
         return 1
 
-    order = {"fit": 0, "nearly_fit": 1, "far_fetched": 2}
-    assessed.sort(key=lambda x: order.get(x.get("fit_assessment", ""), 3))
+    # Extract sections
+    csv_content  = extract_section(response_text, "csv_data")
+    summary      = extract_section(response_text, "search_summary")
+    key_findings = extract_section(response_text, "key_findings")
+    opp_count    = extract_section(response_text, "opportunities_found")
 
-    # Step 5 — Build Excel
-    date_str   = datetime.now().strftime("%Y%m%d")
-    excel_path = OUTPUT_DIR / f"BSA_Opportunities_{date_str}.xlsx"
-    build_excel(assessed, excel_path)
+    if not csv_content:
+        log.error("No <csv_data> section found in Claude response — cannot save report")
+        # Save raw response for debugging
+        debug_path = OUTPUT_DIR / f"debug_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        debug_path.write_text(response_text, encoding="utf-8")
+        log.info(f"Raw response saved for debugging → {debug_path}")
+        return 1
 
-    # Step 6 — Send email
-    send_email(excel_path, assessed)
+    # Save CSV
+    date_str  = datetime.now().strftime("%Y%m%d")
+    csv_path  = OUTPUT_DIR / f"BSA_Opportunities_{date_str}.csv"
+    save_csv(csv_content, csv_path)
 
-    fit_c = sum(1 for o in assessed if o.get("fit_assessment") == "fit")
-    log.info(
-        f"=== Done === | {len(assessed)} total | {fit_c} strong fit | "
-        f"Excel: {excel_path}"
-    )
+    # Send email
+    send_email(csv_path, summary, key_findings, opp_count)
+
+    log.info(f"=== Done === | {opp_count} opportunities | CSV: {csv_path}")
     return 0
 
 

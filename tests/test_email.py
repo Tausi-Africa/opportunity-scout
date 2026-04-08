@@ -1,123 +1,115 @@
 """
-Tests for send_email(): success path, auth failure, SMTP errors, fallback file.
+Tests for email building and sending.
 """
 import smtplib
-
-from unittest.mock import MagicMock, patch, mock_open
-from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import main as m
 
 
-def _opps(fit_count: int = 2, near_count: int = 1, far_count: int = 1) -> list[dict]:
-    def _o(fit):
-        return {
-            "title": f"Opp ({fit})", "organization": "Org",
-            "deadline": "30 June 2026", "budget": "USD 50,000",
-            "fit_assessment": fit,
-        }
-    return (
-        [_o("fit")] * fit_count
-        + [_o("nearly_fit")] * near_count
-        + [_o("far_fetched")] * far_count
-    )
-
-
 @pytest.fixture(autouse=True)
 def patch_credentials(monkeypatch):
     monkeypatch.setattr(m, "SENDER_EMAIL", "sender@gmail.com")
-    monkeypatch.setattr(m, "SENDER_PASS",  "app-password-here")
+    monkeypatch.setattr(m, "SENDER_PASS", "app-password-here")
+
+
+class TestBuildEmailBody:
+    def test_contains_opportunity_count(self):
+        body = m._build_email_body("Sources searched.", "1. FSDT RFP", "7")
+        assert "7" in body
+
+    def test_contains_key_findings(self):
+        body = m._build_email_body("Summary.", "Top finding: FSDT", "3")
+        assert "Top finding: FSDT" in body
+
+    def test_contains_search_summary(self):
+        body = m._build_email_body("Searched 14 portals.", "Finding 1", "5")
+        assert "Searched 14 portals." in body
+
+    def test_greets_alex(self):
+        body = m._build_email_body("Summary.", "Findings.", "2")
+        assert "Alex" in body
 
 
 class TestSendEmail:
     def test_returns_true_on_success(self, tmp_output):
-        excel = tmp_output / "report.xlsx"
-        excel.write_bytes(b"fake xlsx content")
+        csv_path = tmp_output / "report.csv"
+        csv_path.write_text("col1,col2\nval1,val2")
 
         mock_smtp = MagicMock()
         mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
-        mock_smtp.__exit__  = MagicMock(return_value=False)
+        mock_smtp.__exit__ = MagicMock(return_value=False)
 
         with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
-            result = m.send_email(excel, _opps())
+            result = m.send_email(csv_path, "summary", "findings", "3")
 
         assert result is True
         mock_smtp.login.assert_called_once_with("sender@gmail.com", "app-password-here")
         mock_smtp.sendmail.assert_called_once()
 
-    def test_email_body_contains_fit_count(self):
-        """_build_email_body includes the strong fit count in plain text (no encoding)."""
-        body, fit_c, _, _ = m._build_email_body(_opps(fit_count=3))
-        assert fit_c == 3
-        assert "3" in body
-        assert "Strong Fit" in body
+    def test_csv_file_attached(self, tmp_output):
+        csv_path = tmp_output / "report.csv"
+        csv_path.write_text("col1,col2\nval1,val2")
 
-    def test_returns_false_and_saves_fallback_on_auth_error(self, tmp_output):
-        excel = tmp_output / "report.xlsx"
-        excel.write_bytes(b"fake xlsx content")
+        captured = {}
+
+        def fake_sendmail(from_addr, to_addr, msg_str):
+            captured["raw"] = msg_str
 
         mock_smtp = MagicMock()
         mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
-        mock_smtp.__exit__  = MagicMock(return_value=False)
+        mock_smtp.__exit__ = MagicMock(return_value=False)
+        mock_smtp.sendmail.side_effect = fake_sendmail
+
+        with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
+            m.send_email(csv_path, "summary", "findings", "3")
+
+        assert csv_path.name in captured.get("raw", "")
+
+    def test_returns_false_when_credentials_not_set(self, tmp_output, monkeypatch):
+        monkeypatch.setattr(m, "SENDER_EMAIL", None)
+        monkeypatch.setattr(m, "SENDER_PASS", None)
+        csv_path = tmp_output / "report.csv"
+        csv_path.write_text("col1,col2\nval1,val2")
+
+        result = m.send_email(csv_path, "summary", "findings", "3")
+        assert result is False
+
+    def test_returns_false_on_auth_error(self, tmp_output):
+        csv_path = tmp_output / "report.csv"
+        csv_path.write_text("col1,col2\nval1,val2")
+
+        mock_smtp = MagicMock()
+        mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
+        mock_smtp.__exit__ = MagicMock(return_value=False)
         mock_smtp.login.side_effect = smtplib.SMTPAuthenticationError(535, b"auth failed")
 
         with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
-            result = m.send_email(excel, _opps())
+            result = m.send_email(csv_path, "summary", "findings", "3")
 
         assert result is False
-        # Fallback file should be written next to the Excel
-        fallback = excel.with_suffix(".email_body.txt")
-        assert fallback.exists()
 
-    def test_returns_false_on_generic_smtp_error(self, tmp_output):
-        excel = tmp_output / "report.xlsx"
-        excel.write_bytes(b"fake xlsx content")
+    def test_returns_false_on_smtp_error(self, tmp_output):
+        csv_path = tmp_output / "report.csv"
+        csv_path.write_text("col1,col2\nval1,val2")
 
         mock_smtp = MagicMock()
         mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
-        mock_smtp.__exit__  = MagicMock(return_value=False)
+        mock_smtp.__exit__ = MagicMock(return_value=False)
         mock_smtp.login.side_effect = smtplib.SMTPException("server unavailable")
 
         with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
-            result = m.send_email(excel, _opps())
+            result = m.send_email(csv_path, "summary", "findings", "3")
 
         assert result is False
 
     def test_returns_false_on_network_error(self, tmp_output):
-        excel = tmp_output / "report.xlsx"
-        excel.write_bytes(b"fake xlsx content")
+        csv_path = tmp_output / "report.csv"
+        csv_path.write_text("col1,col2\nval1,val2")
 
         with patch("main.smtplib.SMTP_SSL", side_effect=OSError("connection refused")):
-            result = m.send_email(excel, _opps())
+            result = m.send_email(csv_path, "summary", "findings", "3")
 
         assert result is False
-
-    def test_returns_false_when_credentials_not_set(self, tmp_output, monkeypatch):
-        monkeypatch.setattr(m, "SENDER_EMAIL", None)
-        monkeypatch.setattr(m, "SENDER_PASS",  None)
-        excel = tmp_output / "report.xlsx"
-        excel.write_bytes(b"fake xlsx content")
-
-        result = m.send_email(excel, _opps())
-        assert result is False
-
-    def test_excel_file_attached(self, tmp_output):
-        excel = tmp_output / "report.xlsx"
-        excel.write_bytes(b"fake xlsx content")
-
-        captured_msg = {}
-
-        def fake_sendmail(from_addr, to_addr, msg_str):
-            captured_msg["raw"] = msg_str
-
-        mock_smtp = MagicMock()
-        mock_smtp.__enter__ = MagicMock(return_value=mock_smtp)
-        mock_smtp.__exit__  = MagicMock(return_value=False)
-        mock_smtp.sendmail.side_effect = fake_sendmail
-
-        with patch("main.smtplib.SMTP_SSL", return_value=mock_smtp):
-            m.send_email(excel, _opps())
-
-        assert excel.name in captured_msg.get("raw", "")
