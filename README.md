@@ -1,26 +1,25 @@
-# APA Opportunity Scout
+# BSA Opportunity Scout
 
-Automated weekly pipeline that scrapes 13+ Tanzania procurement portals, uses Claude AI to assess fit against the company profile, and delivers a colour-coded Excel report to `alex@bsa.ai` every Monday morning.
+Automated weekly system that uses Claude AI to research Tanzania consulting opportunities across 50+ sources, compile a verified CSV report, upload it to Google Drive, and deliver a formatted HTML email to the team every Monday morning.
 
 ---
 
 ## How it works
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  GitHub Actions — every Monday 07:00 EAT                │
-│                                                         │
-│  1. Run tests (must pass before proceeding)             │
-│  2. Claude searches web for new opportunity portals     │
-│  3. Scrape 13 known sites + any Claude-discovered sites │
-│     ├── Requests + BeautifulSoup for static pages       │
-│     └── Playwright + Chromium for JS-rendered pages     │
-│  4. Download and parse PDFs found on opportunity pages  │
-│  5. Claude assesses each opportunity against            │
-│     company profile → fit / nearly_fit / far_fetched    │
-│  6. Build colour-coded Excel report                     │
-│  7. Email report + summary to alex@bsa.ai               │
-└─────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  Claude.ai Routine — every Monday 09:00 AM EAT                    │
+│                                                                 │
+│  1. Read SKILL.md from connected GitHub repo                   │
+│  2. Read company knowledge files + additional_urls.txt         │
+│  3. Plan + execute search across all 13 source categories      │
+│     └── 50+ portals: UN agencies, DFIs, embassies, aggregators│
+│  4. Filter, verify URLs, score relevance (High/Medium/Low)     │
+│  5. Compile CSV (14 columns, strict no-fabrication rules)      │
+│  6. Upload CSV to Google Drive → OpportunityScout Reports/     │
+│  7. Send HTML email via Gmail connector with CSV attached       │
+│     └── To: alex@bsa.ai / CC: rwebu, mnzava                   │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -29,208 +28,107 @@ Automated weekly pipeline that scrapes 13+ Tanzania procurement portals, uses Cl
 
 ```
 opportunity-scout/
-├── scripts/
-│   └── main.py                  # Full pipeline (scrape → assess → Excel → email)
-├── tests/
-│   ├── conftest.py              # Shared pytest fixtures
-│   ├── test_scraper.py          # HTTP, HTML parsing, PDF extraction
-│   ├── test_assessor.py         # Claude AI fit assessment
-│   ├── test_excel_builder.py    # Excel output and colour coding
-│   ├── test_email.py            # SMTP sending and fallback
-│   └── test_pipeline.py        # End-to-end integration tests
+├── .claude/
+│   └── skills/
+│       └── opportunity-scout/
+│           └── SKILL.md              # Full operating instructions for the routine
 ├── knowledgebase/
-│   └── company_profile.txt      # Company profile read at runtime
-├── .github/
-│   └── workflows/
-│       └── weekly_scout.yml     # GitHub Actions — tests + scout
-├── .env                         # Local credentials (never committed)
-└── requirements.txt             # Python dependencies
+│   ├── company_profile.txt            # AfroPavo company profile
+│   └── additional_urls.txt            # Priority portals to search first
+├── instruction.md                     # Step-by-step routine instructions (copy into Claude.ai)
+└── README.md
 ```
 
 ---
 
-## Opportunity sources
+## Output format
 
-| Source | Type | Notes |
-|---|---|---|
-| UNGM | UN procurement | JS-rendered, Playwright |
-| World Bank | Project opportunities | JS-rendered, Playwright |
-| EU Tenders | European donor | JS-rendered, Playwright, Tanzania filter |
-| US Embassy Tanzania | US government contracts | Static |
-| African Development Bank | AfDB procurement | JS-rendered, Playwright |
-| GIZ Tanzania | German development | Static |
-| GIZ Ausschreibungen | GIZ procurement portal | JS-rendered, Playwright |
-| DG Market | Multi-donor tenders | Static, Tanzania filter |
-| FSDT | Financial sector deepening | Static |
-| CRDB Bank | Bank procurement | Static |
-| NBC Bank | Bank procurement | Static |
-| NMB Bank | Bank procurement | Static |
-| India HC Tanzania | Indian high commission | Static |
-| + Claude-discovered | Found fresh each run | Dynamic |
+Each run produces a CSV named `OpportunityScout_YYYYMMDD.csv` with 14 columns:
 
-Claude also searches the web at the start of each run to discover new portals (UNDP, PPRA, ministry pages, bilateral donors, etc.) and adds them to the scrape list automatically.
+| Column | Description |
+|---|---|
+| `Opportunity_Title` | Full name exactly as posted |
+| `Type` | EOI / RFP / CFP / Tender / Grant / Other |
+| `Organization` | Issuing agency — exactly as named |
+| `URL` | Verified, working direct link |
+| `Contact_Email` | As found — `Not Found` if absent |
+| `Contact_Phone` | As found — `Not Found` if absent |
+| `Contact_Person` | As named — `Not Found` if absent |
+| `Deadline` | YYYY-MM-DD — `Not Stated` if absent |
+| `Qualification_Criteria` | Stated criteria only — `Not Found` if none |
+| `Consortium_Allowed` | Yes / No / Not Stated |
+| `Description` | 2–3 sentence summary from source |
+| `Relevance_Score` | High / Medium / Low |
+| `Flags` | Eligibility concerns — `None` if clean |
+| `Date_Found` | Run date in YYYY-MM-DD |
+
+**Accuracy rule:** every field contains real extracted data, `Not Found`, or `Not Stated`. Nothing is ever guessed or approximated. Opportunities without a verified working URL are excluded entirely.
 
 ---
 
-## Fit assessment
+## Sources searched
 
-Each opportunity is assessed by Claude against the company profile and classified as:
+The routine searches 13 source categories on every run:
 
-| Label | Colour | Meaning |
+| # | Category | Examples |
 |---|---|---|
-| **fit** | Green | Core services match, eligible, likely meets requirements |
-| **nearly_fit** | Yellow | 60–80% match — minor sector or experience gap |
-| **far_fetched** | Red | Significant mismatch in sector, geography, or requirements |
+| 1 | Priority URLs | Every URL in `additional_urls.txt` — searched first |
+| 2 | LinkedIn | EOI/RFP/tender searches for Tanzania + East Africa |
+| 3 | Tanzania Government | PPRA, eGP Portal, Ministry of Finance, ICT, TRA |
+| 4 | Development Finance | World Bank, AfDB, IFC, UNCDF, EIB |
+| 5 | UN & Multilateral | UNDP, UNICEF, UN Women, FAO, WFP, ILO, WHO |
+| 6 | Bilateral Donors | USAID, GIZ, FCDO, EU, SIDA, Norad, DANIDA, MCC, Gates |
+| 7 | Financial / Fintech | FSDT, FSD Africa, CGAP, GSMA, Accion, Cenfri, BFA Global |
+| 8 | Agriculture & Climate | AGRA, IFAD, CGIAR, GIZ AgriFinance, USAID Feed the Future |
+| 9 | Tender Aggregators | Devex, DevelopmentAid, TenderTanzania, dgMarket, ReliefWeb, ImpactPool, TED, SAM.gov |
+| 10 | Global Opportunity Platforms | opportunitiesforyouth.org, opportunitydesk.org, Idealist, GlobalGiving, Open Society, Ford, Rockefeller, Mastercard, Aga Khan |
+| 11 | Embassies in Tanzania | 25 missions — US, UK, Germany, France, Japan, India, Canada, Australia, Netherlands, Sweden, Norway, Denmark, Finland, Switzerland, Belgium, Italy, South Africa, EU Delegation, China, Turkey, South Korea, Ireland, Brazil, Russia, Spain |
+| 12 | Consulting & Innovation Hubs | Tony Elumelu Foundation, Catalyst Fund, Hivos, Ifakara Innovation Hub, BID Network |
+| 13 | Research & Academic | J-PAL Africa, IPA, IGC Tanzania, ODI, CGDEV, 3ie |
 
-For each opportunity, the report captures:
+---
 
-- Title, issuing organisation, opportunity type (RFP / EOI / Call for Tenders)
-- Sectors and background context
-- Deadline and budget (or notes if budget is to be proposed)
-- Eligibility criteria (parsed from page text and PDFs)
-- Fit assessment and reasoning
-- Contact email and direct application link
+## Email delivery
+
+Every run sends a formatted HTML email:
+
+- **Subject:** `OpportunityScout Weekly Report — YYYY-MM-DD`
+- **To:** alex@bsa.ai
+- **CC:** rwebu@bsa.ai, mnzava@gmail.com, mnzava@afropavoanalytics.com
+- **Body:** Stats banner (Total / High / Medium / Low), top opportunity callout, Google Drive link, attachment note — fully HTML-formatted and character-escaped
+- **Attachment:** `OpportunityScout_YYYYMMDD.csv` attached directly
+- **Google Drive:** CSV also uploaded to `OpportunityScout Reports/` with public view link
+
+If Google Drive is unavailable, the email is sent with attachment only. If Gmail also fails, the full CSV is displayed in the routine response for manual sending.
 
 ---
 
 ## Setup
 
-### 1. Fork or clone this repository
+### 1. Connect the GitHub repository
 
-```bash
-git clone https://github.com/your-org/opportunity-scout.git
-cd opportunity-scout
-```
+In your Claude.ai project settings, connect this repository so the routine can read files from it.
 
-### 2. Add GitHub repository secrets
+### 2. Connect Gmail and Google Drive
 
-Go to **Settings → Secrets and variables → Actions → New repository secret** and add:
+In your Claude.ai project, enable the **Gmail** and **Google Drive** integrations.
 
-| Secret name | Value |
-|---|---|
-| `ANTHROPIC_API_KEY` | Your key from [console.anthropic.com](https://console.anthropic.com) |
-| `SENDER_EMAIL` | The Gmail/Google Workspace address that sends the report |
-| `SENDER_APP_PASSWORD` | 16-character App Password (see below) |
+### 3. Add the routine
 
-#### Creating a Gmail App Password
+1. Go to your Claude.ai project → **Routines**
+2. Create a new routine scheduled for every Monday at your preferred time
+3. Copy the full contents of [instruction.md](instruction.md) and paste it into the routine instruction box
 
-1. Sign in to the sender account at [myaccount.google.com](https://myaccount.google.com)
-2. Go to **Security → 2-Step Verification** and enable it
-3. Go to **Security → App passwords** (or [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords))
-4. Name it `BSA Scout` and click **Create**
-5. Copy the 16-character password and paste it as `SENDER_APP_PASSWORD`
-
-### 3. Run manually (first test)
-
-Go to your GitHub repo → **Actions** tab → **Weekly BSA Opportunity Scout** → **Run workflow**.
-
-Watch the logs live. On success, `alex@bsa.ai` receives the Excel report within ~20 minutes.
-
-After that, it runs automatically every **Monday at 07:00 EAT** with no further action needed.
-
----
-
-## Local development
-
-```bash
-# Create and activate virtual environment
-python3 -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install Playwright's Chromium browser
-playwright install chromium
-
-# Copy and fill in credentials
-cp .env.example .env           # then edit .env with real values
-```
-
-`.env` file format:
-
-```
-ANTHROPIC_API_KEY=sk-ant-...
-SENDER_EMAIL=alex@bsa.ai
-SENDER_APP_PASSWORD=xxxx xxxx xxxx xxxx
-```
-
-Run the pipeline locally:
-
-```bash
-python scripts/main.py
-```
-
-Run the test suite:
-
-```bash
-pytest tests/ -v --cov=scripts --cov-report=term-missing
-```
-
----
-
-## Error handling
-
-| Scenario | Behaviour |
-|---|---|
-| Site returns 404 / 403 | Skipped immediately, no retry |
-| Site returns 500 / timeout | Retried up to 3× with exponential backoff |
-| Playwright fails on JS site | Falls back to plain requests automatically |
-| One site completely unreachable | Logged as error, rest of pipeline continues |
-| Claude returns malformed JSON | Assessment skipped, opportunity logged and dropped |
-| Claude API rate limit | Logged, assessment skipped for that item |
-| SMTP auth fails | Detailed fix instructions logged; email body saved as `.email_body.txt` next to the Excel file |
-| No opportunities scraped | Pipeline exits with code 1, warning logged |
-| Company profile missing | Pipeline exits with code 2, clear error message |
-
-If email delivery fails for any reason, the full email body is saved alongside the Excel report as a `.email_body.txt` file and uploaded as a GitHub Actions artifact (retained 90 days).
+The routine follows 9 steps automatically, with a verification checkpoint after each one.
 
 ---
 
 ## Updating the company profile
 
-Edit [knowledgebase/company_profile.txt](knowledgebase/company_profile.txt) directly. The file is read fresh on every run — no code changes needed. Claude uses it to assess fit, so keep it current with your latest capabilities and sector focus.
+Edit [knowledgebase/company_profile.txt](knowledgebase/company_profile.txt) directly in the repository. The routine reads it fresh on every run — no other changes needed. For richer context, also update the project knowledge files (`afropavo_company_data_a.md`, `afropavo_company_data_b.md`) in the Claude.ai project.
 
 ---
 
-## Updating target sectors / keywords
+## Adding priority search URLs
 
-Edit the `KEYWORDS` list in [scripts/main.py](scripts/main.py):
-
-```python
-KEYWORDS = [
-    "research", "data", "analytics", "finance", "credit", "digital",
-    "facilitation", "consulting", "advisory", ...
-]
-```
-
-Only opportunities whose title contains at least one keyword are fetched and assessed. Add domain-specific terms to increase recall.
-
----
-
-## Adding a new site manually
-
-Add an entry to the `SITES` list in [scripts/main.py](scripts/main.py):
-
-```python
-{"name": "Portal Name", "url": "https://portal.org/tenders", "country_filter": None, "use_playwright": False}
-```
-
-- Set `country_filter` to `"Tanzania"` if the portal lists global opportunities and needs filtering
-- Set `use_playwright` to `True` for portals that require JavaScript to render content
-
----
-
-## CI/CD pipeline
-
-The GitHub Actions workflow runs two jobs in sequence:
-
-```
-test  ──→  scout
-```
-
-**`test` job** — runs the full pytest suite with 70% coverage minimum. If any test fails, the scout job does not run.
-
-**`scout` job** — installs Playwright Chromium, runs the pipeline, uploads the Excel report as an artifact regardless of outcome.
-
-Both jobs are triggered by the weekly schedule and by manual dispatch.
+Add one URL per line to [knowledgebase/additional_urls.txt](knowledgebase/additional_urls.txt). The routine treats every URL in this file as a Priority 1 source and searches it before all other categories.
